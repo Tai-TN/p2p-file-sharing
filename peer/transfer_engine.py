@@ -50,14 +50,14 @@ class TransferEngine:
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
-        # Bước 1: Gửi ANNOUNCE ban đầu lên Tracker
+        # Gửi ANNOUNCE ban đầu lên Tracker
         self._announce_to_tracker(event="started")
 
-        # Bước 2: Bắt đầu luồng heartbeat announce định kỳ
+        # Bắt đầu luồng heartbeat announce định kỳ
         announce_thread = threading.Thread(target=self._periodic_announce, daemon=True)
         announce_thread.start()
 
-        # Bước 3: Tạo và chạy luồng Worker Pool tải song song
+        # Tạo và chạy luồng Worker Pool tải song song
         worker_threads = []
         for i in range(self.max_workers):
             t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
@@ -70,7 +70,7 @@ class TransferEngine:
             self._save_progress()
 
         if self.piece_manager.is_complete():
-            print(f"[TransferEngine {self.peer_id}] 🎉 TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
+            print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
             self._announce_to_tracker(event="completed")
             self._remove_progress_file()
             return True
@@ -215,8 +215,9 @@ class TransferEngine:
         if not available_peers:
             return False
 
-        # Thử lấy từ 1 peer ngẫu nhiên trong danh sách các peer sở hữu mảnh
-        p_id, p_info = available_peers[0]
+        # Chọn ngẫu nhiên 1 peer trong danh sách (phân tải đều giữa nhiều Seeder)
+        import random
+        p_id, p_info = random.choice(available_peers)
         sock = p_info["sock"]
 
         try:

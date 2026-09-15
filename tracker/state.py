@@ -84,3 +84,20 @@ class TrackerState:
                     del self.swarms[info_hash]
 
             return removed_count
+
+    def get_all_swarms_info(self) -> Dict[str, Dict]:
+        """Trả về thống kê tổng quan tất cả các Swarm đang hoạt động (dùng để hiển thị trạng thái Tracker)."""
+        result = {}
+        now = time.time()
+        with self.lock:
+            for info_hash, swarm in self.swarms.items():
+                seeders  = sum(1 for p in swarm.values() if p.get("left", 1) == 0)
+                leechers = sum(1 for p in swarm.values() if p.get("left", 1) > 0)
+                active   = sum(1 for p in swarm.values() if now - p["last_seen"] <= self.peer_timeout)
+                if active > 0:
+                    result[info_hash[:8] + "..."] = {
+                        "peer_count": active,
+                        "seeders":    seeders,
+                        "leechers":   leechers
+                    }
+        return result

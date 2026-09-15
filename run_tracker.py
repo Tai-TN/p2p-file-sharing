@@ -1,17 +1,22 @@
-import argparse
+"""
+run_tracker.py — Khởi động Tracker Server
+Chạy: python run_tracker.py
+"""
 import time
 from tracker.tracker_server import TrackerServer
 
-def main():
-    parser = argparse.ArgumentParser(description="Chạy máy chủ Tracker P2P File Sharing")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="IP lắng nghe của Tracker (mặc định 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8000, help="Cổng lắng nghe của Tracker (mặc định 8000)")
-    args = parser.parse_args()
+# ── Cấu hình ──
+HOST = "127.0.0.1"
+PORT = 8000
 
-    tracker = TrackerServer(host=args.host, port=args.port)
+def main():
+    print(f"----- Tracker Server đang khởi động tại {HOST}:{PORT} -----")
+
+    tracker = TrackerServer(host=HOST, port=PORT, peer_timeout=120.0)
     tracker.start()
 
-    print("Nhấn Ctrl+C để dừng Tracker Server...")
+    print(f"----- Tracker đang chạy-----\n")
+
     try:
         while True:
             time.sleep(1)

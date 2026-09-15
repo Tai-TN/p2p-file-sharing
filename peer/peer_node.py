@@ -60,7 +60,7 @@ class PeerNode:
             self.active_sockets[peer_addr_key] = conn
 
         try:
-            # 1. Nhận HANDSHAKE từ Peer kết nối đến
+            # Nhận HANDSHAKE từ Peer kết nối đến
             msg = recv_msg(conn)
             if not msg or msg.get("type") != MessageType.HANDSHAKE.value:
                 return
@@ -70,7 +70,7 @@ class PeerNode:
                 print(f"[Peer Server {self.peer_id}] Lỗi Handshake: Sai info_hash từ {addr}")
                 return
 
-            # 2. Gửi HANDSHAKE_RESPONSE và BITFIELD cho Peer
+            # Gửi HANDSHAKE_RESPONSE và BITFIELD cho Peer
             hs_resp = {
                 "type": MessageType.HANDSHAKE_RESPONSE.value,
                 "info_hash": self.info_hash,
@@ -81,7 +81,7 @@ class PeerNode:
             bitfield_msg = create_bitfield_msg(self.piece_manager.get_bitfield())
             send_msg(conn, bitfield_msg)
 
-            # 3. Vòng lặp nhận và phục vụ các yêu cầu (REQUEST / KEEP_ALIVE)
+            # Vòng lặp nhận và phục vụ các yêu cầu (REQUEST / KEEP_ALIVE)
             while self.is_running:
                 req = recv_msg(conn)
                 if not req:
@@ -96,8 +96,8 @@ class PeerNode:
                             piece_response = create_piece_msg(piece_idx, data)
                             send_msg(conn, piece_response)
                 elif req_type == MessageType.KEEP_ALIVE.value:
-                    pass
-
+                    pass # Nếu chỉ là yêu càu duy trì kết nối thì paasss -> Để giữa kết nối 
+ 
         except Exception as e:
             pass
         finally:
