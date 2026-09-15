@@ -16,6 +16,11 @@ from .messages import (
     create_piece_msg,
     create_keepalive_msg
 )
+# xác định những tên được xem là API public của package.
+"""
+from protocol import *
+thì Python sẽ lấy các tên nằm trong __all__:
+"""
 
 __all__ = [
     'MessageType',

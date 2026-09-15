@@ -1,225 +1,212 @@
-# TÀI LIỆU HƯỚNG DẪN CHI TIẾT DỰ ÁN P2P FILE SHARING
+# TÀI LIỆU HƯỚNG DẪN CHI TIẾT & GIẢI THÍCH MÃ NGUỒN DỰ ÁN P2P FILE SHARING
 
-Tài liệu này tổng hợp chi tiết kiến thức lý thuyết, thiết kế kiến trúc và giải thích từng dòng code của dự án chia sẻ file ngang hàng (P2P File Sharing).
+Tài liệu này giải thích chi tiết kiến trúc hệ thống, danh sách tất cả các hàm đã code, tham số đầu vào, kết quả đầu ra, luồng chạy thực tế và logic chi tiết từng dòng code của dự án chia sẻ file ngang hàng (P2P File Sharing).
 
 ---
 
 ## TỔNG QUAN KIẾN TRÚC MẠNG P2P
 
-Trong mô hình Client-Server truyền thống, máy chủ (Server) phải gánh toàn bộ băng thông phục vụ cho tất cả các Client tải file. Nếu số lượng Client tăng đột biến, Server sẽ bị nghẽn mạng (bottleneck).
-
-Mô hình **Peer-to-Peer (P2P)** giải quyết bài toán này bằng cách:
-1. **Tracker Server**: Đóng vai trò làm "sổ bạ" (Directory). Tracker **không chứa file data**, mà chỉ ghi nhận danh sách các máy (Peer) đang tham gia mạng và sở hữu file.
-2. **Peer**: Mỗi máy vừa đóng vai trò **Client** (tải các mảnh file còn thiếu từ các Peer khác) vừa đóng vai trò **Server** (lên lịch cho phép các Peer khác tải mảnh file mình đã có).
-3. **Piece Manager**: File gốc được chia thành nhiều mảnh nhỏ (Piece) có kích thước cố định (ví dụ: 512 KB). Mỗi Piece được kiểm tra tính đúng đắn bằng chuỗi băm **SHA-256**.
-
 ```
  +--------------------------------------------------------------------+
  |                           TRACKER SERVER                           |
- |              (Quản lý danh sách Peer & thông tin file)              |
+ |            (Quản lý danh sách Peer chia sẻ file theo Hash)          |
  +--------------------------------------------------------------------+
                    ^                               ^
       1. Announce  |                               | 1. Announce
       & Get Peers  v                               v & Get Peers
        +-----------------------+              +-----------------------+
        |   PEER A (Seeder)     |<============>|   PEER B (Leecher)    |
-       |   (Đã có 100% file)   | 2. P2P Direct|   (Đang tải từng     |
+       |   (Đã có 100% file)   | 2. Direct P2P|   (Đang tải từng     |
        +-----------------------+    Transfer  |    mảnh Piece)        |
                                               +-----------------------+
 ```
 
 ---
 
-## PHẦN 1: GIAO THỨC MẠNG & SOCKET TCP (`protocol/`)
+## PHẦN 1: GIAO THỨC MẠNG & FRAMING PROTOCOL (`protocol/messages.py`)
 
-### 1.1. Bài toán "Dính gói TCP" (TCP Packet Fragmentation & Message Gluing)
+File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-sharing/protocol/messages.py)
 
-Giao thức TCP (Transmission Control Protocol) là giao thức **dòng byte (byte-stream)** chứ không phải giao thức **dòng thông điệp (message-stream)**. Khi bạn gọi `socket.sendall()`, TCP có thể hợp nhất nhiều lệnh `send` thành một gói IP lớn, hoặc xé nhỏ một thông điệp JSON thành nhiều gói IP nhỏ.
+### 1.1. Các hàm xử lý Socket Framing
 
-- **Dính gói (Gluing)**: Gửi `{"type": "A"}` và `{"type": "B"}` -> Bên nhận đọc được `{"type": "A"}{"type": "B"}` trong một lệnh `recv()` => Lỗi `json.loads()`.
-- **Xé gói (Fragmentation)**: Gửi một thông điệp JSON dài 2000 byte -> Bên nhận chỉ `recv()` được 1024 byte đầu tiên => Lỗi `json.loads()` do thiếu dữ liệu.
+- **`recv_exact(sock, num_bytes) -> Optional[bytes]`**: Đọc đúng và đủ `num_bytes` từ socket TCP để giải quyết triệt để vấn đề xé gói (Fragmentation).
+- **`send_msg(sock, payload: dict) -> bool`**: Đóng gói Dictionary JSON với **4-byte length prefix** (Big-Endian) trước khi gửi qua TCP socket.
+- **`recv_msg(sock) -> Optional[dict]`**: Đọc 4 byte tiêu đề $\rightarrow$ giải mã lấy độ dài $L$ $\rightarrow$ đọc tiếp đúng $L$ bytes nội dung $\rightarrow$ `json.loads()`.
 
-### 1.2. Giải pháp: Framing với 4-Byte Length Prefix
+### 1.2. Danh sách Message Builders
 
-Để xử lý triệt để vấn đề này, dự án sử dụng quy tắc **Length-Prefix Framing**:
-Mỗi thông điệp truyền qua mạng được đóng gói theo dạng:
+- `create_announce_msg()`, `create_get_peers_msg()`, `create_handshake_msg()`, `create_bitfield_msg()`, `create_have_msg()`, `create_request_msg()`, `create_piece_msg()`, `create_keepalive_msg()`.
 
+---
+
+## PHẦN 2: QUẢN LÝ STORAGE & PIECE MANAGER (`storage/`)
+
+### 2.1. Module Metainfo File (`storage/metainfo.py`)
+
+- **`create_metainfo(file_path, piece_length=512KB, tracker_url) -> dict`**: Đọc file gốc, chia thành các chunk 512KB, tính mã băm SHA-256 từng mảnh và mã băm định danh duy nhất `info_hash` cho file.
+- **`save_metainfo()`** & **`load_metainfo()`**: Đọc/ghi file `.meta.json`.
+
+### 2.2. Module PieceManager (`storage/piece_manager.py`)
+
+- **`PieceManager.__init__()`**: Khởi tạo mảng `bitfield = [False] * num_pieces` và đối tượng khóa đa luồng `self.file_lock = threading.Lock()`.
+- **`_initialize_storage()`**: Tạo file trống và tiền phân bổ dung lượng (`truncate`), quét và xác minh các mảnh hiện có.
+- **`_get_piece_bounds(piece_index)`**: Tính vị trí byte `offset = piece_index * piece_length` trên đĩa.
+- **`read_piece(piece_index)`**: Kiểm tra mảnh đã có chưa, sau đó đọc dữ liệu từ đĩa bọc trong `with self.file_lock:`.
+- **`write_piece(piece_index, data)`**: Kiểm tra checksum SHA-256 trước. Nếu hợp lệ, ghi xuống đĩa bằng `seek(offset)` và `os.fsync()`, cập nhật `bitfield[piece_index] = True`.
+
+---
+
+## PHẦN 3: MÁY CHỦ TRACKER SERVER (`tracker/`)
+
+### 3.1. Class `TrackerState` (`tracker/state.py`)
+
+- **`register_peer(...)`**: Đăng ký hoặc cập nhật thời gian `last_seen` của Peer trong cấu trúc Swarm `swarms[info_hash]`. Nếu `event == "stopped"`, xóa Peer ra khỏi Swarm.
+- **`get_peers(...)`**: Trả về danh sách địa chỉ `IP:Port` của các Peer đang chia sẻ file, tự động loại trừ chính nút gửi yêu cầu (`exclude_peer_id`).
+- **`cleanup_stale_peers()`**: Quét dọn các Peer "chết" quá thời hạn timeout (60 giây).
+
+### 3.2. Class `TrackerServer` (`tracker/tracker_server.py`)
+
+- **`start()`**: Bind socket `(host, port)`, lắng nghe TCP và khởi chạy luồng ngầm `_accept_loop` và `_periodic_cleanup`.
+- **`_handle_client(conn, addr)`**: Tiếp nhận thông điệp JSON từ Peer, phân loại `ANNOUNCE` hoặc `GET_PEERS` và trả về kết quả qua socket.
+
+---
+
+## PHẦN 4: PEER CLIENT & TRANSFER ENGINE (`peer/`)
+
+Đây là bộ não trung tâm điều khiển việc kết nối P2P trực tiếp giữa các nút Peer với nhau và tải dữ liệu song song.
+
+---
+
+### 4.1. Thuật toán chọn mảnh Rarest-First (`peer/selection.py`)
+
+File: [peer/selection.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-sharing/peer/selection.py)
+
+#### 🔹 `choose_next_piece(missing_pieces: List[int], peer_bitfields: Dict[str, List[bool]], strategy: str = "rarest_first") -> Optional[int]`
+- **Mục đích**: Quyết định mảnh (`piece_index`) nào nên được tải tiếp theo từ danh sách các mảnh còn thiếu `missing_pieces`.
+- **Tham số**:
+  - `missing_pieces`: Danh sách các chỉ số piece mà local peer chưa có (VD: `[0, 2, 4]`).
+  - `peer_bitfields`: Dictionary `{ peer_id: bitfield_list }` của tất cả các Peer đang kết nối với mình.
+  - `strategy`: Chuỗi chiến lược (`"rarest_first"` hoặc `"random"`).
+- **Trả về**: `int` (Chỉ số mảnh nên tải tiếp), hoặc `None` nếu không có mảnh nào khả dụng.
+- **Logic hoạt động**:
+  1. Đếm số lượng Peer sở hữu mảnh `i` trong `missing_pieces`.
+  2. Tìm tần suất sở hữu nhỏ nhất `min_freq` ($> 0$).
+  3. Lọc ra danh sách các mảnh có độ hiếm cao nhất trong mạng P2P.
+  4. Trả về mảnh hiếm nhất để luồng worker ưu tiên tải trước.
+
+---
+
+### 4.2. Class `PeerNode` (`peer/peer_node.py`)
+
+File: [peer/peer_node.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-sharing/peer/peer_node.py)
+
+Nút Peer đóng vai trò làm Server lắng nghe để phục vụ cho các Peer khác kết nối tới xin mảnh file (Seeding).
+
+#### 🔹 `__init__(peer_id, host, port, piece_manager)`
+- Khởi tạo các thuộc tính: `peer_id`, `host`, `port`, `piece_manager`, `info_hash`, và dictionary `active_sockets` lưu danh sách các kết nối P2P đang mở.
+
+#### 🔹 `start_listening()`
+- Bật TCP Socket lắng nghe kết nối tại cổng `port` (`bind` + `listen(64)`).
+- Khởi chạy luồng chạy ngầm Daemon Thread `_accept_loop()`.
+
+#### 🔹 `_accept_loop()`
+- Vòng lặp `accept()` liên tục. Khi có kết nối P2P đến từ Peer khác, tạo 1 luồng worker `_handle_peer_connection(conn, addr)`.
+
+#### 🔹 `_handle_peer_connection(conn, addr)`
+- **Logic xử lý**:
+  1. Đợi nhận thông điệp `HANDSHAKE` từ đối phương. Kiểm tra `info_hash` trong tin nhắn có đúng với file mình đang mở không.
+  2. Phản hồi `HANDSHAKE_RESPONSE` và gửi ngay tin nhắn `BITFIELD` (báo mảng mảnh mình đang sở hữu).
+  3. Vào vòng lặp nhận tin nhắn từ đối phương:
+     - Nếu nhận `REQUEST(piece_index)`: Đọc dữ liệu mảnh từ đĩa qua `piece_manager.read_piece(piece_index)`, mã hóa Base64 và phản hồi tin nhắn `PIECE(piece_index, data)`.
+     - Nếu nhận `KEEP_ALIVE`: Bỏ qua duy trì kết nối.
+
+#### 🔹 `broadcast_have(piece_index: int)`
+- **Mục đích**: Phát tin nhắn `HAVE(piece_index)` cho tất cả các Peer đang kết nối mở socket với mình ngay sau khi vừa tải xong 1 mảnh mới.
+
+#### 🔹 `stop()`
+- Đặt `is_running = False`, đóng toàn bộ các kết nối socket trong `active_sockets` và đóng `server_socket`.
+
+---
+
+### 4.3. Class `TransferEngine` (`peer/transfer_engine.py`)
+
+File: [peer/transfer_engine.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-sharing/peer/transfer_engine.py)
+
+Động cơ đa luồng chịu trách nhiệm hỏi Tracker, mở kết nối P2P tới các máy khác và tải song song các mảnh file.
+
+#### 🔹 `__init__(peer_id, tracker_host, tracker_port, listen_port, piece_manager, max_workers=4)`
+- Cấu hình địa chỉ Tracker, nút Peer Listener, và khởi tạo tập hợp `in_flight_pieces` (các mảnh đang được luồng worker tải) cùng đường dẫn file vết tiến độ `.progress.json`.
+
+#### 🔹 `start_download(peer_node=None) -> bool`
+- **Logic điều khiển**:
+  1. Gửi `ANNOUNCE(event="started")` lên Tracker.
+  2. Bắt đầu luồng gửi heartbeat định kỳ `_periodic_announce()`.
+  3. Tạo nhóm **Worker Pool** gồm `max_workers` (4 luồng) chạy song song `_worker_loop()`.
+  4. Vòng lặp chính ngủ `0.5s` và gọi `_save_progress()`.
+  5. Khi `piece_manager.is_complete() == True`: Gửi `ANNOUNCE(event="completed")` báo Tracker đã thành Seeder, xóa file tiến độ và trả về `True`.
+
+#### 🔹 `_announce_to_tracker(event="started") -> List[dict]`
+- Mở kết nối TCP ngắn hạn tới Tracker Server, gửi tin nhắn `ANNOUNCE` chứa `downloaded` và `left`.
+- Mở tiếp kết nối gửi `GET_PEERS` để lấy về danh sách các máy `[{"peer_id": ..., "ip": ..., "port": ...}]`.
+
+#### 🔹 `_periodic_announce()`
+- Vòng lặp vô tận ngủ 20 giây một lần (`time.sleep(20)`), gọi `_announce_to_tracker()` và cập nhật danh sách các máy mới qua `_update_peer_connections()`.
+
+#### 🔹 `_update_peer_connections(peers_list)`
+- Duyệt qua danh sách máy nhận từ Tracker. Mở kết nối socket TCP tới các máy mới chưa có trong `connected_peers`, gửi `HANDSHAKE` và nhận tin nhắn `BITFIELD` để cập nhật vào `connected_peers[p_id]`.
+
+#### 🔹 `_worker_loop(worker_id: int)`
+- **Vòng lặp của từng luồng Worker**:
+  1. Lấy danh sách các mảnh còn thiếu `missing` (loại bỏ các mảnh đang được luồng khác tải trong `in_flight_pieces`).
+  2. Gọi `choose_next_piece()` theo thuật toán **Rarest-First** để chọn chỉ số mảnh `target_piece` tốt nhất.
+  3. Thêm `target_piece` vào `in_flight_pieces` để các luồng khác không tải trùng.
+  4. Gọi `_download_piece_from_any_peer(target_piece)` để xin dữ liệu mảnh.
+  5. Xóa `target_piece` khỏi `in_flight_pieces`.
+
+#### 🔹 `_download_piece_from_any_peer(piece_index) -> bool`
+- Tìm trong `connected_peers` danh sách các máy sở hữu mảnh `piece_index`.
+- Gửi tin nhắn `REQUEST(piece_index)` qua TCP socket tới máy đó.
+- Nhận thông điệp `PIECE`, giải mã Base64 dữ liệu.
+- Gọi `piece_manager.write_piece(piece_index, data)` để ghi đĩa và kiểm tra checksum SHA-256.
+- Nếu thành công, gọi `peer_node.broadcast_have(piece_index)` để phát tin tức cho toàn mạng P2P.
+
+#### 🔹 `_save_progress()` & `_remove_progress_file()`
+- Ghi đĩa file `.progress.json` chứa `info_hash` và mảng `bitfield` phục vụ việc Resume download khi tạm ngắt chương trình.
+
+#### 🔹 `stop()`
+- Dừng `is_running = False` và đóng toàn bộ các kết nối socket trong `connected_peers`.
+
+---
+
+## 🔄 LUỒNG CHẠY TỔNG THỂ KHI 1 PEER TẢI FILE (EXECUTION FLOW)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Máy Leecher (B)
+    participant Engine as TransferEngine (B)
+    participant Tracker as Tracker Server
+    participant PeerA as Máy Seeder (A)
+    participant Disk as PieceManager (B)
+
+    User->>Engine: Bắt đầu tải file (start_download)
+    Engine->>Tracker: ANNOUNCE (event="started", port=7002)
+    Tracker-->>Engine: ANNOUNCE_RESPONSE (status="OK")
+    Engine->>Tracker: GET_PEERS (info_hash)
+    Tracker-->>Engine: GET_PEERS_RESPONSE ([Peer A: 127.0.0.1:7001])
+    
+    Engine->>PeerA: TCP Connect & HANDSHAKE (info_hash)
+    PeerA-->>Engine: HANDSHAKE_RESPONSE & BITFIELD ([True, True, True])
+    
+    loop Worker Threads Tải Song Song
+        Engine->>Engine: Lựa chọn mảnh hiếm nhất (Rarest-First) -> Chọn Piece 0
+        Engine->>PeerA: REQUEST (piece_index=0)
+        PeerA->>Engine: PIECE (piece_index=0, data=Base64)
+        Engine->>Disk: write_piece(0, data) -> Verify SHA-256
+        Disk-->>Engine: Ghi đĩa thành công -> bitfield[0] = True
+        Engine->>PeerA: broadcast_have(0)
+    end
+
+    Engine->>Tracker: ANNOUNCE (event="completed", left=0)
+    Engine-->>User: 🎉 TẢI HOÀN TẤT 100% -> Chuyển sang chế độ Seeder
 ```
-+------------------------------------+----------------------------------+
-|  4-Byte Tiêu đề chỉ độ dài (Length) |  Nội dung thông điệp dạng JSON   |
-|     (Số nguyên Big-Endian 32-bit)  |          (UTF-8 Bytes)           |
-+------------------------------------+----------------------------------+
-```
-
-#### Quy trình gửi (`send_msg`):
-1. Chuyển Python Dictionary thành chuỗi JSON dạng bytes UTF-8 (`raw_json`).
-2. Tính độ dài `L = len(raw_json)`.
-3. Đóng gói `L` thành 4 byte số nguyên sử dụng `struct.pack(">I", L)`.
-4. Gửi `4 byte độ dài + raw_json` qua socket (`sock.sendall()`).
-
-#### Quy trình nhận (`recv_msg`):
-1. Đọc đúng **4 byte đầu tiên** bằng hàm `recv_exact(sock, 4)`. Giải mã số nguyên `L = struct.unpack(">I", length_prefix)[0]`.
-2. Đọc tiếp đúng **L bytes** nội dung bằng hàm `recv_exact(sock, L)`.
-3. Giải mã UTF-8 và chuyển thành Python Dictionary với `json.loads()`.
-
-### 1.3. Mã hóa dữ liệu nhị phân (Binary Data in JSON)
-
-Vì thông điệp truyền tải dưới dạng JSON, các mảng byte nhị phân của mảnh file (Piece data) không thể chèn trực tiếp vào chuỗi JSON. 
-Dự án sử dụng chuẩn mã hóa **Base64** (`base64.b64encode()` và `base64.b64decode()`) để biến mảng byte nhị phân thành chuỗi văn bản an toàn khi gửi qua JSON.
-
-### 1.4. Các loại thông điệp (Message Types)
-
-| Tên thông điệp | Hướng truyền | Mục đích |
-|---|---|---|
-| `ANNOUNCE` | Peer -> Tracker | Báo danh Peer đang online, báo tiến độ tải file |
-| `ANNOUNCE_RESPONSE` | Tracker -> Peer | Phản hồi xác nhận từ Tracker |
-| `GET_PEERS` | Peer -> Tracker | Xin danh sách các Peer đang sở hữu file |
-| `GET_PEERS_RESPONSE` | Tracker -> Peer | Trả về danh sách IP:Port các Peer đang sở hữu file |
-| `HANDSHAKE` | Peer <-> Peer | Bắt tay ban đầu giữa 2 Peer, kiểm tra `info_hash` trùng khớp |
-| `BITFIELD` | Peer -> Peer | Gửi mảng boolean/bit đánh dấu mảnh nào đã có / mảnh nào thiếu |
-| `HAVE` | Peer -> Peer | Phát tin (broadcast) khi vừa tải xong 1 mảnh mới |
-| `REQUEST` | Peer -> Peer | Yêu cầu Peer khác gửi dữ liệu mảnh số `piece_index` |
-| `PIECE` | Peer -> Peer | Trả về dữ liệu mảnh `piece_index` (mã hóa Base64) |
-| `KEEP_ALIVE` | Peer <-> Peer | Giữ kết nối socket không bị timeout |
-
----
----
-
-## PHẦN 2: STORAGE & PIECE MANAGER (`storage/`)
-
-### 2.1. Kiến trúc phân mảnh File & Metadata (.torrent style)
-
-Trong mô hình chia sẻ file P2P, tập tin không được gửi nguyên khối mà được chia nhỏ thành hàng trăm hoặc hàng ngàn **mảnh (Piece)** có kích thước cố định (mặc định 512 KB).
-
-- **Tại sao phải chia mảnh?**
-  1. **Tải song song (Parallel Downloads)**: Một Peer (Leecher) có thể tải mảnh 0 từ Peer A, mảnh 1 từ Peer B, mảnh 2 từ Peer C cùng một lúc, khai thác tối đa băng thông đường truyền.
-  2. **Giảm thiểu rủi ro gián đoạn**: Nếu rớt mạng giữa chừng, Peer chỉ cần tải lại mảnh 512 KB bị gián đoạn chứ không phải tải lại toàn bộ file từ đầu.
-  3. **Chia sẻ tức thì (Fast Seeding)**: Ngay khi Peer vừa tải xong 1 mảnh bất kỳ, nó có thể chia sẻ (seed) ngay mảnh đó cho các Peer khác trong mạng mà không cần chờ tải xong 100% file.
-
-- **Cấu trúc Metadata (`PieceMetadata`)**:
-  - `filename`: Tên file gốc.
-  - `file_size`: Tổng dung lượng file tính theo bytes.
-  - `piece_size`: Kích thước mỗi mảnh (bytes, mặc định 512 KB).
-  - `total_pieces`: Tổng số mảnh $= \lceil \text{file\_size} / \text{piece\_size} \rceil$.
-  - `piece_hashes`: Danh sách mảng chuỗi hash SHA-256 của từng mảnh `[hash_0, hash_1, ..., hash_N-1]`.
-  - `info_hash`: Chuỗi băm SHA-256 tổng thể đại diện cho toàn bộ thông tin metadata (dùng làm ID duy nhất để định danh file trong mạng P2P).
-
-```
-File gốc (VD: 1.5 MB)
-+------------------------+------------------------+------------------------+
-| Piece 0 (512 KB)       | Piece 1 (512 KB)       | Piece 2 (476 KB)       |
-| SHA-256: 4a8b...       | SHA-256: 9e3f...       | SHA-256: 1c7d...       |
-+------------------------+------------------------+------------------------+
-```
-
-### 2.2. Kỹ thuật ghi đĩa không theo thứ tự (Out-of-Order Disk I/O với `seek`)
-
-Vì các mảnh piece được tải về ngẫu nhiên từ nhiều Peer khác nhau (ví dụ: nhận mảnh 2 trước mảnh 0), hệ thống không thể sử dụng cơ chế ghi nối tiếp thông thường (`open("file", "ab")`).
-
-#### Giải pháp 2 bước:
-1. **Khởi tạo File rỗng (Sparse File Pre-allocation)**:
-   Khi Leecher bắt đầu tải file mới, `PieceManager` tạo một file rỗng trên đĩa với dung lượng đúng bằng `file_size` sử dụng phương thức `f.truncate(file_size)`.
-2. **Ghi ngẫu nhiên với `f.seek(offset)`**:
-   Vị trí byte bắt đầu của mảnh thứ `i` trên đĩa được tính theo công thức:
-   $$\text{Offset}_i = i \times \text{piece\_size}$$
-   Khi tải thành công mảnh `i`, tiến trình mở file ở chế độ đọc/ghi nhị phân (`r+b`), di chuyển con trỏ đĩa tới `Offset_i` và ghi dữ liệu của mảnh đó vào đúng vị trí.
-
-### 2.3. Kiểm tra tính toàn vẹn dữ liệu (Integrity Verification với SHA-256)
-
-Môi trường P2P có rủi ro nhiễu đường truyền làm hỏng dữ liệu hoặc gặp Peer độc hại cố tình gửi dữ liệu rác (Poisoning Attack).
-Do đó, trước khi ghi bất kỳ mảnh dữ liệu nào xuống đĩa cứng, `PieceManager` **bắt buộc** xác minh checksum SHA-256:
-
-1. Tính hash SHA-256 của khối bytes vừa nhận: `actual_hash = hashlib.sha256(data).hexdigest()`.
-2. So sánh `actual_hash` với `expected_hash` lưu trong metadata của mảnh đó.
-3. Nếu **khớp**: Tiến hành ghi mảnh vào đĩa và đánh dấu mảnh đó đã sở hữu (`bitfield[i] = True`).
-4. Nếu **không khớp**: Hủy bỏ khối dữ liệu rác, báo lỗi và yêu cầu hàng đợi tải lại mảnh đó từ Peer khác.
-
-### 2.4. Quản lý trạng thái Bitfield & Đồng bộ đa luồng (Thread Synchronization)
-
-- **Mảng Bitfield**: Mảng boolean `[True, False, True, ...]` đại diện cho từng mảnh file (mảnh đã có = `True`, mảnh còn thiếu = `False`).
-- **Đồng bộ đa luồng (`threading.Lock`)**:
-  Hệ thống P2P sử dụng nhiều luồng đồng thời: các luồng **Download Manager** ghi mảnh mới nhận xuống đĩa, đồng thời các luồng **Upload Peer Connection** đọc các mảnh từ đĩa để gửi cho Peer khác. Để tránh hiện tượng **Race Condition** hay hỏng con trỏ đĩa, toàn bộ thao tác `read_piece` và `write_piece` đều được bảo vệ bởi khóa `threading.Lock()`.
-- **Khôi phục tiến độ tải (Resume Download)**:
-  Khi khởi động lại ứng dụng với một file đang tải dở, `PieceManager` đọc từng khối đĩa và kiểm tra SHA-256 với metadata. Mảnh nào có sẵn và hợp lệ sẽ tự động được gán `bitfield[i] = True`, cho phép tiếp tục tải các mảnh thiếu mà không cần làm lại từ đầu.
-
-### 2.5. Giải thích mã nguồn chi tiết (`storage/piece_manager.py`)
-
-#### Class `PieceMetadata`
-- `create_from_file(file_path, piece_size)`: Đọc file từng chunk `piece_size`, tạo danh sách `piece_hashes` và `info_hash`.
-- `to_dict()` & `from_dict()`: Hỗ trợ serialization/deserialization metadata để truyền nhận JSON qua mạng.
-
-#### Class `PieceManager`
-- `__init__(save_path, metadata, is_seeder)`: Khởi tạo file đĩa rỗng (nếu Leecher) hoặc kiểm tra file có sẵn để khôi phục `bitfield`.
-- `get_piece_length(piece_index)`: Trả về độ dài của piece (mảnh cuối có thể nhỏ hơn `piece_size`).
-- `verify_piece(piece_index, data)`: So sánh SHA-256 của `data` với băm lưu trong metadata.
-- `read_piece(piece_index)`: Đọc dữ liệu mảnh từ đĩa với `f.seek(offset)` trong khối `with self.lock:`.
-- `write_piece(piece_index, data)`: Ghi mảnh xuống đĩa tại `offset` đúng vị trí và cập nhật `bitfield[piece_index] = True`.
-- `get_progress()`: Trả về phần trăm hoàn thành $= (\text{Số mảnh đã có} / \text{Tổng số mảnh}) \times 100\%$.
-
----
----
-
-## PHẦN 3: KIỂM THỬ TỰ ĐỘNG (UNIT TESTING - `tests/`)
-
-### 3.1. Triết lý & Cấu trúc Kiểm thử Unit Test
-
-Trong xây dựng phần mềm mạng và P2P, **Unit Test (Kiểm thử đơn vị)** đóng vai trò sống còn để đảm bảo:
-1. Các thông điệp JSON và khung Length-Prefix Framing truyền qua Socket luôn đúng chuẩn, không bị dính gói hay thiếu byte.
-2. Các phép toán trên đĩa (ghi ngẫu nhiên offset với `seek()`, chia chunk, tính băm SHA-256) không bị rò rỉ hay làm sai lệch dữ liệu file gốc.
-3. Chống lỗi lặp lại (Regression Bugs): Khi nâng cấp tính năng mới không làm gãy các tính năng đã chạy ổn định trước đó.
-
-Dự án sử dụng framework **`unittest`** tiêu chuẩn của Python.
-Lệnh thực thi toàn bộ bộ test tự động:
-```bash
-python3 -m unittest discover -s tests
-```
-
----
-
-### 3.2. Giải thích chi tiết `tests/test_protocol.py` (Kiểm thử Giao thức Mạng)
-
-File [test_protocol.py](file:///home/taitn/Study/Năm%203/PBL4/p2p-file-sharing/tests/test_protocol.py) có nhiệm vụ giả lập kết nối mạng giữa 2 đầu socket và xác minh quy trình đóng gói/giải mã thông điệp JSON.
-
-#### 1. Kỹ thuật `socket.socketpair()`
-- Thay vì phải bind địa chỉ IP thực tế (dễ bị xung đột port hoặc bị chặn bởi Firewall khi test), `socket.socketpair()` tạo ra 2 socket nối trực tiếp với nhau ngay trong bộ nhớ RAM (`parent_sock` và `child_sock`).
-- Mọi dữ liệu gửi qua `parent_sock.sendall()` sẽ đi thẳng tới `child_sock.recv()`.
-
-#### 2. Chi tiết các Test Cases:
-- **`test_send_and_recv_msg`**:
-  - Gửi một thông điệp `ANNOUNCE` mẫu qua `parent_sock` với `send_msg()`.
-  - Nhận thông điệp ở `child_sock` bằng `recv_msg()`.
-  - Sử dụng `self.assertEqual(...)` để kiểm tra độ chính xác của các trường metadata (`type`, `info_hash`, `peer_id`, `port`).
-- **`test_binary_piece_encoding`**:
-  - Tạo dữ liệu nhị phân chứa các byte đặc biệt: `b"Hello P2P... \x00\xff\xfe"`.
-  - Mã hóa thành Base64 string thông qua `create_piece_msg()`.
-  - Sau khi nhận qua socket, giải mã Base64 bằng `base64.b64decode()` và dùng `self.assertEqual()` đối chiếu với `original_data` ban đầu.
-- **`test_bitfield_creation`**:
-  - Kiểm tra hàm khởi tạo thông điệp `create_bitfield_msg([True, True, False, True])` trả về đúng cấu trúc Dictionary chuẩn.
-
----
-
-### 3.3. Giải thích chi tiết `tests/test_piece_manager.py` (Kiểm thử Quản lý File & Băm SHA-256)
-
-File [test_piece_manager.py](file:///home/taitn/Study/Năm%203/PBL4/p2p-file-sharing/tests/test_piece_manager.py) sử dụng thư mục tạm (`tempfile.mkdtemp()`) và dữ liệu nhị phân ngẫu nhiên để kiểm thử thực tế việc chia mảnh và đọc/ghi đĩa.
-
-#### 1. Setup & Teardown Môi trường Test:
-- `setUp()`: Sinh ngẫu nhiên một file đĩa 350 bytes (`os.urandom(350)`) với `piece_size = 100` (tạo ra 4 mảnh: 100, 100, 100, 50 bytes).
-- `tearDown()`: Xóa sạch thư mục tạm sau khi test xong bằng `shutil.rmtree()` để không để lại dữ liệu rác.
-
-#### 2. Chi tiết các Test Cases:
-- **`test_metadata_creation`**:
-  - Kiểm tra `PieceMetadata.create_from_file()` chia đúng 4 mảnh piece.
-  - Kiểm tra tính năng chuyển đổi Dictionary (`to_dict` / `from_dict`) tái tạo chính xác `info_hash`.
-- **`test_out_of_order_write_and_read`**:
-  - Giả lập tải file ngẫu nhiên không theo thứ tự: Ghi mảnh 2 $\rightarrow$ mảnh 0 $\rightarrow$ mảnh 3 $\rightarrow$ mảnh 1.
-  - Kiểm tra tiến độ phần trăm `get_progress()` tăng dần tương ứng (25% $\rightarrow$ 50% $\rightarrow$ 75% $\rightarrow$ 100%).
-  - Đọc lại toàn bộ file trên đĩa sau khi hoàn thành 100% và so sánh bằng `self.assertEqual(downloaded_data, source_data)` để đảm bảo khớp chính xác 100% từng byte với file gốc.
-- **`test_corrupted_piece_rejection`**:
-  - Cố tình truyền dữ liệu bị hỏng (`b"X" * 100`) vào `write_piece(0, corrupted_data)`.
-  - Kiểm tra hàm trả về `False` và `bitfield[0]` vẫn giữ giá trị `False` (không cho phép ghi dữ liệu rác xuống đĩa).
-- **`test_existing_file_resume`**:
-  - Tạo `PieceManager` 1 và ghi 2 mảnh (piece 0, piece 1).
-  - Tắt manager 1 và mở `PieceManager` 2 trên cùng file đó (giả lập khởi động lại ứng dụng).
-  - Kiểm tra manager 2 tự động quét đĩa, khôi phục mảnh 0 và 1 đã có (`True`) và xác định chính xác danh sách mảnh còn thiếu `[2, 3]`.
-
-

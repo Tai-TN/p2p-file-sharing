@@ -1,172 +1,146 @@
 import os
-import hashlib
 import threading
-from typing import List, Dict, Any, Optional
-
-DEFAULT_PIECE_SIZE = 512 * 1024  # 512 KB (mặc định)
-
-class PieceMetadata:
-    """
-    Quản lý thông tin metadata của file chia sẻ (tương tự file .torrent).
-    """
-    def __init__(self, filename: str, file_size: int, piece_size: int, piece_hashes: List[str], info_hash: str = ""):
-        self.filename = filename
-        self.file_size = file_size
-        self.piece_size = piece_size
-        self.piece_hashes = piece_hashes
-        self.total_pieces = len(piece_hashes)
-        self.info_hash = info_hash or self.compute_info_hash()
-
-    def compute_info_hash(self) -> str:
-        """Tính SHA-256 tổng thể của metadata."""
-        concat_str = f"{self.filename}:{self.file_size}:{self.piece_size}:" + "".join(self.piece_hashes)
-        return hashlib.sha256(concat_str.encode('utf-8')).hexdigest()
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "filename": self.filename,
-            "file_size": self.file_size,
-            "piece_size": self.piece_size,
-            "total_pieces": self.total_pieces,
-            "piece_hashes": self.piece_hashes,
-            "info_hash": self.info_hash
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'PieceMetadata':
-        return cls(
-            filename=data["filename"],
-            file_size=data["file_size"],
-            piece_size=data["piece_size"],
-            piece_hashes=data["piece_hashes"],
-            info_hash=data.get("info_hash", "")
-        )
-
-    @classmethod
-    def create_from_file(cls, file_path: str, piece_size: int = DEFAULT_PIECE_SIZE) -> 'PieceMetadata':
-        """
-        Đọc một file trên đĩa, chia nhỏ thành các piece và tính chuỗi băm SHA-256 cho từng piece.
-        """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File không tồn tại: {file_path}")
-
-        filename = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
-        piece_hashes = []
-
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(piece_size)
-                if not chunk:
-                    break
-                piece_hash = hashlib.sha256(chunk).hexdigest()
-                piece_hashes.append(piece_hash)
-
-        return cls(filename, file_size, piece_size, piece_hashes)
-
+import hashlib
+from typing import Dict, Any, List, Optional
 
 class PieceManager:
     """
-    Quản lý việc đọc/ghi file trên đĩa cứng, xác minh checksum SHA-256,
-    và theo dõi mảng bitfield cho các piece đã sở hữu/còn thiếu.
+    Quản lý việc đọc, ghi các mảnh (Piece) của tập tin trên đĩa.
+    Đảm bảo an toàn đa luồng (Thread-safe) khi nhiều worker thread tải và ghi file đồng thời.
     """
-    def __init__(self, save_path: str, metadata: PieceMetadata, is_seeder: bool = False):
-        self.save_path = save_path
-        self.metadata = metadata
-        self.lock = threading.Lock()
+    def __init__(self, target_file_path: str, metainfo: Dict[str, Any]):
+        self.target_file_path = target_file_path
+        self.metainfo = metainfo
+        self.info = metainfo["info"]
+        self.file_size = self.info["file_size"]
+        self.piece_length = self.info["piece_length"]
+        self.expected_hashes = self.info["pieces"]
+        self.num_pieces = len(self.expected_hashes)
+
+        # Thread lock ngăn ngừa ghi đè vị trí seek() khi nhiều luồng truy cập file cùng lúc
+        self.file_lock = threading.Lock()
+
+        # Bitfield: Danh sách boolean đánh dấu mảnh nào đã tải đúng, mảnh nào chưa
+        self.bitfield: List[bool] = [False] * self.num_pieces
+
+        # Chuẩn bị file đĩa và quét kiểm tra các piece đã sẵn có
+        self._initialize_storage()
+
+    def _initialize_storage(self) -> None:
+        """
+        Khởi tạo tập tin trên đĩa và xác minh các mảnh đã có sẵn (nếu có).
+        """
+        with self.file_lock:
+            # Tạo file trống nếu chưa tồn tại
+            if not os.path.exists(self.target_file_path):
+                os.makedirs(os.path.dirname(os.path.abspath(self.target_file_path)), exist_ok=True)
+                with open(self.target_file_path, "wb") as f:
+                    # Tiền phân bổ dung lượng file (Pre-allocate file size)
+                    f.truncate(self.file_size)
+
+        # Đọc và xác minh hash của từng mảnh trên đĩa
+        self.verify_all_pieces()
+
+    def verify_all_pieces(self) -> None:
+        """Xác minh toàn bộ các piece hiện có trên đĩa so với SHA-256 mong đợi."""
+        for i in range(self.num_pieces):
+            piece_data = self._read_raw_piece(i)
+            if piece_data and self._hash_matches(i, piece_data):
+                self.bitfield[i] = True
+            else:
+                self.bitfield[i] = False
+
+    def _get_piece_bounds(self, piece_index: int) -> tuple:
+        """Tính offset bắt đầu và độ dài thực tế của mảnh thứ piece_index."""
+        offset = piece_index * self.piece_length
+        if piece_index == self.num_pieces - 1:
+            # Piece cuối cùng có thể nhỏ hơn piece_length chuẩn
+            length = self.file_size - offset
+        else:
+            length = self.piece_length
+        return offset, length
+
+    def _hash_matches(self, piece_index: int, data: bytes) -> bool:
+        """Kiểm tra mã băm SHA-256 của data có trùng với expected_hashes[piece_index] không."""
+        computed = hashlib.sha256(data).hexdigest()
+        return computed == self.expected_hashes[piece_index]
+
+    def _read_raw_piece(self, piece_index: int) -> Optional[bytes]:
+        """Đọc raw bytes của mảnh piece_index từ đĩa tại vị trí offset chuẩn xác."""
+        if piece_index < 0 or piece_index >= self.num_pieces:
+            return None
+
+        offset, length = self._get_piece_bounds(piece_index)
         
-        # Mảng boolean theo dõi piece nào đã sở hữu
-        self.bitfield: List[bool] = [is_seeder] * metadata.total_pieces
-        
-        # Nếu file chưa tồn tại (leecher tải mới), khởi tạo file trống đúng dung lượng
-        if not os.path.exists(save_path):
-            directory = os.path.dirname(save_path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(save_path, "wb") as f:
-                f.truncate(metadata.file_size)
-        elif not is_seeder:
-            # Nếu file đã tồn tại một phần, kiểm tra hash từng piece để khôi phục bitfield (Resume download)
-            self._verify_existing_file()
-
-    def _verify_existing_file(self):
-        """Kiểm tra các piece hiện có trong file để khôi phục lại bitfield khi khởi động lại."""
-        with open(self.save_path, "rb") as f:
-            for idx in range(self.metadata.total_pieces):
-                offset = idx * self.metadata.piece_size
-                f.seek(offset)
-                piece_len = self.get_piece_length(idx)
-                chunk = f.read(piece_len)
-                if len(chunk) == piece_len:
-                    current_hash = hashlib.sha256(chunk).hexdigest()
-                    if current_hash == self.metadata.piece_hashes[idx]:
-                        self.bitfield[idx] = True
-
-    def get_piece_length(self, piece_index: int) -> int:
-        """Tính độ dài chính xác của mảnh piece_index (mảnh cuối có thể nhỏ hơn piece_size)."""
-        if piece_index < 0 or piece_index >= self.metadata.total_pieces:
-            raise IndexError("Piece index ngoài phạm vi")
-        if piece_index == self.metadata.total_pieces - 1:
-            remainder = self.metadata.file_size % self.metadata.piece_size
-            return remainder if remainder > 0 else self.metadata.piece_size
-        return self.metadata.piece_size
-
-    def verify_piece(self, piece_index: int, data: bytes) -> bool:
-        """Xác minh tính đúng đắn của dữ liệu mảnh nhận được bằng SHA-256."""
-        if piece_index < 0 or piece_index >= self.metadata.total_pieces:
-            return False
-        expected_hash = self.metadata.piece_hashes[piece_index]
-        actual_hash = hashlib.sha256(data).hexdigest()
-        return actual_hash == expected_hash
+        with self.file_lock:
+            try:
+                with open(self.target_file_path, "rb") as f:
+                    f.seek(offset)
+                    data = f.read(length)
+                    if len(data) == length:
+                        return data
+                    return None
+            except Exception as e:
+                print(f"[Storage Error] Lỗi đọc piece {piece_index}: {e}")
+                return None
 
     def read_piece(self, piece_index: int) -> Optional[bytes]:
-        """Đọc mảnh piece_index từ đĩa cứng (Thread-safe)."""
-        if not self.bitfield[piece_index]:
+        """Đọc mảnh piece_index chỉ khi nó khả dụng và hợp lệ (bitfield == True)."""
+        if not self.has_piece(piece_index):
             return None
-        
-        piece_len = self.get_piece_length(piece_index)
-        offset = piece_index * self.metadata.piece_size
-        
-        with self.lock:
-            with open(self.save_path, "rb") as f:
-                f.seek(offset)
-                data = f.read(piece_len)
-                return data
+        return self._read_raw_piece(piece_index)
 
     def write_piece(self, piece_index: int, data: bytes) -> bool:
-        """Ghi mảnh piece_index xuống đĩa cứng sau khi verify thành công (Thread-safe)."""
-        if not self.verify_piece(piece_index, data):
-            print(f"[Storage Error] Checksum không khớp cho piece {piece_index}")
+        """
+        Ghi dữ liệu mảnh vừa tải về vào đúng vị trí offset trên đĩa.
+        Chỉ ghi khi SHA-256 hash của dữ liệu tải về hoàn toàn hợp lệ.
+        """
+        if piece_index < 0 or piece_index >= self.num_pieces:
             return False
-            
-        offset = piece_index * self.metadata.piece_size
-        
-        with self.lock:
-            with open(self.save_path, "r+b") as f:
-                f.seek(offset)
-                f.write(data)
-                f.flush()
-            self.bitfield[piece_index] = True
-            
-        return True
+
+        offset, expected_length = self._get_piece_bounds(piece_index)
+        if len(data) != expected_length:
+            print(f"[Storage Error] Piece {piece_index} sai độ dài: nhận {len(data)}, chờ {expected_length}")
+            return False
+
+        # Bước 1: Kiểm tra Checksum SHA-256
+        if not self._hash_matches(piece_index, data):
+            print(f"[Storage Error] Piece {piece_index} bị hỏng Checksum SHA-256!")
+            return False
+
+        # Bước 2: Ghi vào đĩa bằng seek() với Thread Lock
+        with self.file_lock:
+            try:
+                with open(self.target_file_path, "r+b") as f:
+                    f.seek(offset)
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())  # Ép buộc ghi dữ liệu từ bộ nhớ RAM xuống đĩa cứng
+                
+                # Cập nhật trạng thái bitfield
+                self.bitfield[piece_index] = True
+                return True
+            except Exception as e:
+                print(f"[Storage Error] Lỗi khi ghi piece {piece_index}: {e}")
+                return False
+
+    def has_piece(self, piece_index: int) -> bool:
+        if 0 <= piece_index < self.num_pieces:
+            return self.bitfield[piece_index]
+        return False
 
     def get_bitfield(self) -> List[bool]:
-        """Trả về bản sao mảng bitfield hiện tại."""
-        with self.lock:
-            return list(self.bitfield)
+        return list(self.bitfield)
+
+    def missing_pieces(self) -> List[int]:
+        """Trả về danh sách chỉ số các piece còn thiếu."""
+        return [i for i, owned in enumerate(self.bitfield) if not owned]
 
     def is_complete(self) -> bool:
-        """Kiểm tra file đã được tải đầy đủ 100% chưa."""
-        with self.lock:
-            return all(self.bitfield)
+        """Kiểm tra file đã tải hoàn tất 100% chưa."""
+        return all(self.bitfield)
 
-    def get_progress(self) -> float:
-        """Tính phần trăm tiến độ hoàn thành (0.0% -> 100.0%)."""
-        with self.lock:
-            downloaded = sum(1 for b in self.bitfield if b)
-            return (downloaded / self.metadata.total_pieces) * 100.0
-
-    def get_missing_pieces(self) -> List[int]:
-        """Lấy danh sách chỉ số các piece chưa có."""
-        with self.lock:
-            return [i for i, owned in enumerate(self.bitfield) if not owned]
+    def progress_percentage(self) -> float:
+        """Tính % tiến độ tải hiện tại."""
+        owned_count = sum(1 for b in self.bitfield if b)
+        return (owned_count / self.num_pieces) * 100.0
