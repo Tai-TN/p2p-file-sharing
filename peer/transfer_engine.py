@@ -3,6 +3,7 @@ import json
 import time
 import socket
 import base64
+import random
 import threading
 from typing import Dict, List, Optional, Tuple
 from storage.piece_manager import PieceManager
@@ -34,7 +35,8 @@ class TransferEngine:
         self.is_running = False
         self.lock = threading.Lock()
 
-        # Quản lý danh sách các peer đã kết nối: { peer_id: { "sock": socket, "bitfield": list[bool], "ip": str, "port": int } }
+        # Quản lý danh sách các peer đã kết nối:
+        # { peer_id: { "sock": socket, "sock_lock": Lock, "bitfield": list[bool], "ip": str, "port": int } }
         self.connected_peers: Dict[str, Dict] = {}
         
         # Đánh dấu các piece đang được 1 luồng worker nào đó tải (để tránh 2 luồng tải trùng piece)
@@ -112,7 +114,6 @@ class TransferEngine:
                 return p_resp["peers"]
             return []
         except Exception as e:
-            # print(f"[TransferEngine {self.peer_id}] Lỗi kết nối Tracker: {e}")
             return []
 
     def _periodic_announce(self) -> None:
@@ -130,25 +131,27 @@ class TransferEngine:
             ip = p_info["ip"]
             port = p_info["port"]
 
+            # Giữ lock trong suốt quá trình kiểm tra + kết nối
+            # để tránh nhiều worker cùng kết nối trùng tới 1 peer
             with self.lock:
                 if p_id in self.connected_peers:
                     continue
 
-            # Thử mở kết nối socket tới Peer mới này
-            sock = self._connect_and_handshake(ip, port)
-            if sock:
-                # Nhận BITFIELD từ Peer
-                bitfield_msg = recv_msg(sock)
-                if bitfield_msg and bitfield_msg.get("type") == MessageType.BITFIELD.value:
-                    bitfield = bitfield_msg.get("bitfield", [])
-                    with self.lock:
+                # Thử mở kết nối socket tới Peer mới này (trong lock)
+                sock = self._connect_and_handshake(ip, port)
+                if sock:
+                    # Nhận BITFIELD từ Peer
+                    bitfield_msg = recv_msg(sock)
+                    if bitfield_msg and bitfield_msg.get("type") == MessageType.BITFIELD.value:
+                        bitfield = bitfield_msg.get("bitfield", [])
                         self.connected_peers[p_id] = {
                             "sock": sock,
+                            "sock_lock": threading.Lock(),  # Lock riêng cho mỗi peer socket
                             "bitfield": bitfield,
                             "ip": ip,
                             "port": port
                         }
-                    print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
+                        print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
         """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
@@ -172,7 +175,7 @@ class TransferEngine:
     def _worker_loop(self, worker_id: int) -> None:
         """Vòng lặp làm việc của Worker Thread: Chọn mảnh hiếm nhất và xin dữ liệu từ Peer."""
         while self.is_running and not self.piece_manager.is_complete():
-            # 1. Kiểm tra và cập nhật danh sách peer
+            # Kiểm tra và cập nhật danh sách peer
             with self.lock:
                 peer_bitfields = {p_id: info["bitfield"] for p_id, info in self.connected_peers.items()}
                 missing = [p for p in self.piece_manager.missing_pieces() if p not in self.in_flight_pieces]
@@ -182,10 +185,10 @@ class TransferEngine:
                 peers = self._announce_to_tracker()
                 if peers:
                     self._update_peer_connections(peers)
-                time.sleep(1.0)
+                time.sleep(2.0)
                 continue
 
-            # 2. Sử dụng thuật toán Rarest-First để chọn mảnh tiếp theo
+            # Sử dụng thuật toán Rarest-First để chọn mảnh tiếp theo
             target_piece = choose_next_piece(missing, peer_bitfields, strategy="rarest_first")
             if target_piece is None:
                 time.sleep(0.5)
@@ -195,14 +198,14 @@ class TransferEngine:
             with self.lock:
                 self.in_flight_pieces.add(target_piece)
 
-            # 3. Tìm Peer sở hữu piece này để xin
+            # Tìm Peer sở hữu piece này để xin
             success = self._download_piece_from_any_peer(target_piece)
             
             with self.lock:
                 self.in_flight_pieces.remove(target_piece)
 
             if not success:
-                time.sleep(0.2)
+                time.sleep(0.5)
 
     def _download_piece_from_any_peer(self, piece_index: int) -> bool:
         """Tìm Peer có mảnh piece_index và gửi tin nhắn REQUEST."""
@@ -216,13 +219,17 @@ class TransferEngine:
             return False
 
         # Chọn ngẫu nhiên 1 peer trong danh sách (phân tải đều giữa nhiều Seeder)
-        import random
         p_id, p_info = random.choice(available_peers)
         sock = p_info["sock"]
+        sock_lock = p_info["sock_lock"]
+
+        # Khóa socket của peer này — chỉ 1 worker được gửi/nhận tại 1 thời điểm
+        if not sock_lock.acquire(timeout=10.0):
+            return False  # Peer đang bận, thử lại sau
 
         try:
             req_msg = create_request_msg(piece_index)
-            sock.settimeout(10.0)
+            sock.settimeout(15.0)
             
             if not send_msg(sock, req_msg):
                 return False
@@ -250,6 +257,8 @@ class TransferEngine:
                     except Exception:
                         pass
                     del self.connected_peers[p_id]
+        finally:
+            sock_lock.release()
         return False
 
     def _save_progress(self) -> None:

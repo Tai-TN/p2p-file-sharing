@@ -8,6 +8,7 @@ class TrackerState:
     Lưu trữ cấu trúc Swarms: info_hash -> { peer_id -> peer_info }
     Đảm bảo an toàn đa luồng (Thread-safe).
     """
+    # 1file -> 1 swarm -> 1 mảng peer có file
     def __init__(self, peer_timeout: float = 60.0):
         self.peer_timeout = peer_timeout
         self.lock = threading.Lock()

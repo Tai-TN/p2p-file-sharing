@@ -44,7 +44,7 @@ class TrackerServer:
         """Vòng lặp chấp nhận kết nối TCP từ các Peer."""
         while self.is_running:
             try:
-                conn, addr = self.server_socket.accept()
+                conn, addr = self.server_socket.accept() # block
                 # Mỗi Peer kết nối đến được xử lý trên 1 Worker Thread riêng biệt
                 client_thread = threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True)
                 client_thread.start()

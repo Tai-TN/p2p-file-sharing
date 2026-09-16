@@ -103,12 +103,12 @@ class PieceManager:
             print(f"[Storage Error] Piece {piece_index} sai độ dài: nhận {len(data)}, chờ {expected_length}")
             return False
 
-        # Bước 1: Kiểm tra Checksum SHA-256
+        # Kiểm tra Checksum SHA-256
         if not self._hash_matches(piece_index, data):
             print(f"[Storage Error] Piece {piece_index} bị hỏng Checksum SHA-256!")
             return False
 
-        # Bước 2: Ghi vào đĩa bằng seek() với Thread Lock
+        #  Ghi vào đĩa bằng seek() với Thread Lock
         with self.file_lock:
             try:
                 with open(self.target_file_path, "r+b") as f:
