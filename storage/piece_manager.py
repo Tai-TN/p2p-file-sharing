@@ -108,15 +108,18 @@ class PieceManager:
             print(f"[Storage Error] Piece {piece_index} bị hỏng Checksum SHA-256!")
             return False
 
-        #  Ghi vào đĩa bằng seek() với Thread Lock
+        # Ghi vào đĩa bằng seek() với Thread Lock
+        # Không dùng fsync() vì sẽ block toàn bộ I/O pipeline khi tải file lớn
+        # (fsync() trên mỗi mảnh → 12000+ lần force-flush → đơ máy)
+        # OS sẽ tự flush page cache xuống đĩa theo lịch trình của nó.
         with self.file_lock:
             try:
                 with open(self.target_file_path, "r+b") as f:
                     f.seek(offset)
                     f.write(data)
+                    # f.flush() đủ để đảm bảo dữ liệu vào kernel buffer
                     f.flush()
-                    os.fsync(f.fileno())  # Ép buộc ghi dữ liệu từ bộ nhớ RAM xuống đĩa cứng
-                
+
                 # Cập nhật trạng thái bitfield
                 self.bitfield[piece_index] = True
                 return True
@@ -140,7 +143,10 @@ class PieceManager:
         """Kiểm tra file đã tải hoàn tất 100% chưa."""
         return all(self.bitfield)
 
+    def completed_pieces_count(self) -> int:
+        """Trả về số lượng piece đã tải xong."""
+        return sum(1 for b in self.bitfield if b)
+
     def progress_percentage(self) -> float:
         """Tính % tiến độ tải hiện tại."""
-        owned_count = sum(1 for b in self.bitfield if b)
-        return (owned_count / self.num_pieces) * 100.0
+        return (self.completed_pieces_count() / self.num_pieces) * 100.0

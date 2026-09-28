@@ -67,9 +67,14 @@ class TransferEngine:
             worker_threads.append(t)
 
         # Chờ cho tới khi tải xong 100% hoặc bị dừng
+        # Lưu progress mỗi 10 giây thay vì mỗi 0.5s — tránh ghi JSON lớn liên tục
+        last_save = 0
         while self.is_running and not self.piece_manager.is_complete():
             time.sleep(0.5)
-            self._save_progress()
+            now = time.time()
+            if now - last_save >= 10.0:
+                self._save_progress()
+                last_save = now
 
         if self.piece_manager.is_complete():
             print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
@@ -224,7 +229,8 @@ class TransferEngine:
         sock_lock = p_info["sock_lock"]
 
         # Khóa socket của peer này — chỉ 1 worker được gửi/nhận tại 1 thời điểm
-        if not sock_lock.acquire(timeout=10.0):
+        acquired = sock_lock.acquire(timeout=10.0)
+        if not acquired:
             return False  # Peer đang bận, thử lại sau
 
         try:
@@ -242,7 +248,7 @@ class TransferEngine:
 
                     # Ghi mảnh xuống đĩa và kiểm tra SHA-256
                     if self.piece_manager.write_piece(piece_index, piece_data):
-                        print(f"[TransferEngine {self.peer_id}] 🟢 Đã tải & Verify thành công Piece {piece_index} từ Peer {p_id} ({self.piece_manager.progress_percentage():.1f}%)")
+                        print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ từ Peer {p_id} ({self.piece_manager.progress_percentage():.1f}%)")
                         
                         # Phát tin nhắn HAVE đến tất cả các peer kết nối nếu có peer_node
                         if self.peer_node:
@@ -258,7 +264,9 @@ class TransferEngine:
                         pass
                     del self.connected_peers[p_id]
         finally:
-            sock_lock.release()
+            # Chỉ release nếu đã acquire thành công
+            if acquired:
+                sock_lock.release()
         return False
 
     def _save_progress(self) -> None:
