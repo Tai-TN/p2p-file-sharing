@@ -109,15 +109,11 @@ class PieceManager:
             return False
 
         # Ghi vào đĩa bằng seek() với Thread Lock
-        # Không dùng fsync() vì sẽ block toàn bộ I/O pipeline khi tải file lớn
-        # (fsync() trên mỗi mảnh → 12000+ lần force-flush → đơ máy)
-        # OS sẽ tự flush page cache xuống đĩa theo lịch trình của nó.
         with self.file_lock:
             try:
                 with open(self.target_file_path, "r+b") as f:
                     f.seek(offset)
                     f.write(data)
-                    # f.flush() đủ để đảm bảo dữ liệu vào kernel buffer
                     f.flush()
 
                 # Cập nhật trạng thái bitfield

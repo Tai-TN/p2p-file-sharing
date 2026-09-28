@@ -6,7 +6,9 @@ import time
 from tracker.tracker_server import TrackerServer
 
 # ── Cấu hình ──
-HOST = "127.0.0.1"
+# Dùng "0.0.0.0" để lắng nghe trên tất cả network interface (cho phép LAN)
+# Dùng "127.0.0.1" nếu chỉ chạy local trên 1 máy
+HOST = "0.0.0.0"
 PORT = 8000
 
 def main():
