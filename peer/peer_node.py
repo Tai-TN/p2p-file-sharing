@@ -1,6 +1,8 @@
 import socket
+import time
 import threading
 import base64
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 from storage.piece_manager import PieceManager
 from protocol.messages import (
@@ -29,6 +31,9 @@ class PeerNode:
         # Danh sách các socket active đang mở đến peer khác: { (ip, port): socket }
         self.active_sockets: Dict[Tuple[str, int], socket.socket] = {}
         self.sockets_lock = threading.Lock()
+
+        # Log phục vụ Web UI (ghi lại sự kiện kết nối và upload piece)
+        self.serve_log: deque = deque(maxlen=200)
 
     def start_listening(self) -> None:
         """Khởi động lắng nghe kết nối TCP."""
@@ -81,6 +86,13 @@ class PeerNode:
             bitfield_msg = create_bitfield_msg(self.piece_manager.get_bitfield())
             send_msg(conn, bitfield_msg)
 
+            # Log: peer kết nối thành công
+            self.serve_log.append({
+                "time": time.strftime("%H:%M:%S"),
+                "type": "peer_connected",
+                "addr": f"{addr[0]}:{addr[1]}",
+            })
+
             # Vòng lặp nhận và phục vụ các yêu cầu (REQUEST / KEEP_ALIVE)
             while self.is_running:
                 req = recv_msg(conn)
@@ -95,6 +107,13 @@ class PeerNode:
                         if data:
                             piece_response = create_piece_msg(piece_idx, data)
                             send_msg(conn, piece_response)
+                            # Log: đã gửi piece cho peer
+                            self.serve_log.append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "type": "piece_served",
+                                "piece_index": piece_idx,
+                                "to_addr": f"{addr[0]}:{addr[1]}",
+                            })
                 elif req_type == MessageType.KEEP_ALIVE.value:
                     pass # Nếu chỉ là yêu càu duy trì kết nối thì paasss -> Để giữa kết nối 
  

@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tracker Server Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+    <!-- ══ NAVBAR ══ -->
+    <nav class="bg-gray-900 border-b border-gray-800 px-6 py-4">
+        <div class="flex items-center justify-between max-w-6xl mx-auto">
+            <div class="flex items-center gap-3">
+                <span class="text-2xl">🖥️</span>
+                <h1 class="text-xl font-bold">Tracker Server</h1>
+                <span id="status-badge" class="text-xs bg-green-900 text-green-400 px-2 py-0.5 rounded-full">● Running</span>
+            </div>
+            <div class="text-sm text-gray-400">
+                Uptime: <span id="uptime" class="text-gray-200 font-mono">0h 0m 0s</span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-6xl mx-auto p-6 space-y-6">
+
+        <!-- ══ STAT CARDS ══ -->
+        <div class="grid grid-cols-4 gap-4">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Active Swarms</div>
+                <div class="text-3xl font-bold mt-2" id="stat-swarms">0</div>
+                <div class="text-xs text-gray-500 mt-1">Số file đang chia sẻ</div>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Total Peers</div>
+                <div class="text-3xl font-bold mt-2" id="stat-peers">0</div>
+                <div class="text-xs text-gray-500 mt-1">Tổng số nút kết nối</div>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Seeders</div>
+                <div class="text-3xl font-bold mt-2 text-blue-400" id="stat-seeders">0</div>
+                <div class="text-xs text-gray-500 mt-1">🌱 Đang chia sẻ file</div>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Leechers</div>
+                <div class="text-3xl font-bold mt-2 text-purple-400" id="stat-leechers">0</div>
+                <div class="text-xs text-gray-500 mt-1">📥 Đang tải file</div>
+            </div>
+        </div>
+
+        <!-- ══ SWARMS TABLE ══ -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <h2 class="font-semibold text-sm mb-4 flex items-center gap-2">
+                📊 Active Swarms
+                <span class="text-xs text-gray-500 font-normal">(cập nhật mỗi 2 giây)</span>
+            </h2>
+            <div id="swarms-container">
+                <p class="text-gray-500 text-sm py-8 text-center">Chưa có swarm nào hoạt động. Hãy chạy Seeder để bắt đầu.</p>
+            </div>
+        </div>
+
+        <!-- ══ EVENT LOG ══ -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <h2 class="font-semibold text-sm mb-4 flex items-center gap-2">
+                📋 Event Log
+                <span class="text-xs text-gray-500 font-normal">— Thông báo real-time</span>
+            </h2>
+            <div id="events-container" class="space-y-1 max-h-80 overflow-y-auto">
+                <p class="text-gray-500 text-sm py-4 text-center">Chưa có sự kiện nào.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ══ JAVASCRIPT ══ -->
+    <script>
+    // ── Config ──
+    const REFRESH_INTERVAL = 2000;  // 2 giây
+    let lastEventCount = 0;
+
+    // ── Hàm tiện ích ──
+
+    // Tạo badge màu cho role
+    function roleBadge(role) {
+        if (role === "Seeder") {
+            return '<span class="bg-blue-900/60 text-blue-300 px-2 py-0.5 rounded text-xs">🌱 Seeder</span>';
+        }
+        return '<span class="bg-purple-900/60 text-purple-300 px-2 py-0.5 rounded text-xs">📥 Leecher</span>';
+    }
+
+    // Tạo icon + màu cho event type
+    function eventStyle(type) {
+        switch (type) {
+            case "peer_joined":
+                return { icon: "🟢", color: "text-green-400", label: "Kết nối" };
+            case "peer_left":
+                return { icon: "🔴", color: "text-red-400", label: "Thoát" };
+            case "peer_completed":
+                return { icon: "✅", color: "text-blue-400", label: "Tải xong" };
+            case "peer_timeout":
+                return { icon: "⚠️", color: "text-yellow-400", label: "Timeout" };
+            default:
+                return { icon: "ℹ️", color: "text-gray-400", label: type };
+        }
+    }
+
+    // Format byte sang đơn vị đọc được
+    function formatBytes(bytes) {
+        if (bytes === 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB"];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
+    }
+
+    // ── Cập nhật Status ──
+    function updateStatus() {
+        fetch("/api/status")
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById("stat-swarms").textContent = data.total_swarms;
+                document.getElementById("stat-peers").textContent = data.total_peers;
+                document.getElementById("stat-seeders").textContent = data.total_seeders;
+                document.getElementById("stat-leechers").textContent = data.total_leechers;
+                document.getElementById("uptime").textContent = data.uptime;
+            })
+            .catch(() => {
+                document.getElementById("status-badge").textContent = "● Offline";
+                document.getElementById("status-badge").className = "text-xs bg-red-900 text-red-400 px-2 py-0.5 rounded-full";
+            });
+    }
+
+    // ── Cập nhật Swarms Table ──
+    function updateSwarms() {
+        fetch("/api/swarms")
+            .then(res => res.json())
+            .then(swarms => {
+                const container = document.getElementById("swarms-container");
+                const hashes = Object.keys(swarms);
+
+                if (hashes.length === 0) {
+                    container.innerHTML = '<p class="text-gray-500 text-sm py-8 text-center">Chưa có swarm nào hoạt động.</p>';
+                    return;
+                }
+
+                let html = "";
+
+                for (const hash of hashes) {
+                    const s = swarms[hash];
+                    html += `
+                    <div class="mb-4 last:mb-0">
+                        <!-- Swarm header -->
+                        <div class="flex items-center justify-between mb-2 pb-2 border-b border-gray-800">
+                            <div class="flex items-center gap-3">
+                                <span class="font-mono text-xs bg-gray-800 px-2 py-1 rounded">${s.info_hash_short}</span>
+                                <span class="text-xs text-gray-500">${s.total_peers} peers</span>
+                            </div>
+                            <div class="flex gap-3 text-xs">
+                                <span class="text-blue-400">🌱 ${s.seeders} seeders</span>
+                                <span class="text-purple-400">📥 ${s.leechers} leechers</span>
+                            </div>
+                        </div>
+
+                        <!-- Peers table -->
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-xs text-gray-500 uppercase tracking-wider">
+                                    <th class="text-left py-1.5 font-medium">Peer ID</th>
+                                    <th class="text-left py-1.5 font-medium">IP</th>
+                                    <th class="text-left py-1.5 font-medium">Port</th>
+                                    <th class="text-left py-1.5 font-medium">Role</th>
+                                    <th class="text-left py-1.5 font-medium">Downloaded</th>
+                                    <th class="text-left py-1.5 font-medium">Left</th>
+                                    <th class="text-left py-1.5 font-medium">Last Seen</th>
+                                </tr>
+                            </thead>
+                            <tbody>`;
+
+                    for (const p of s.peers) {
+                        html += `
+                                <tr class="border-t border-gray-800/50 hover:bg-gray-800/30">
+                                    <td class="py-2 font-mono text-xs">${p.peer_id}</td>
+                                    <td class="py-2 text-gray-400">${p.ip}</td>
+                                    <td class="py-2">${p.port}</td>
+                                    <td class="py-2">${roleBadge(p.role)}</td>
+                                    <td class="py-2 text-gray-400 text-xs">${formatBytes(p.downloaded)}</td>
+                                    <td class="py-2 text-gray-400 text-xs">${formatBytes(p.left)}</td>
+                                    <td class="py-2">
+                                        <span class="text-xs ${p.last_seen_ago < 30 ? 'text-green-400' : 'text-yellow-400'}">
+                                            ${p.last_seen_ago}s ago
+                                        </span>
+                                    </td>
+                                </tr>`;
+                    }
+
+                    html += `
+                            </tbody>
+                        </table>
+                    </div>`;
+                }
+
+                container.innerHTML = html;
+            });
+    }
+
+    // ── Cập nhật Event Log ──
+    function updateEvents() {
+        fetch("/api/events")
+            .then(res => res.json())
+            .then(events => {
+                const container = document.getElementById("events-container");
+
+                if (events.length === 0) {
+                    container.innerHTML = '<p class="text-gray-500 text-sm py-4 text-center">Chưa có sự kiện nào.</p>';
+                    return;
+                }
+
+                // Chỉ render lại nếu có event mới
+                if (events.length === lastEventCount) return;
+                const isNewEvent = events.length > lastEventCount;
+                lastEventCount = events.length;
+
+                let html = "";
+                for (let i = 0; i < events.length; i++) {
+                    const e = events[i];
+                    const style = eventStyle(e.type);
+                    const isLatest = isNewEvent && i === 0;
+
+                    html += `
+                    <div class="flex items-center gap-3 py-1.5 px-3 rounded ${isLatest ? 'fade-in bg-gray-800/50' : ''} hover:bg-gray-800/30 text-sm">
+                        <span class="text-base">${style.icon}</span>
+                        <span class="text-gray-500 font-mono text-xs w-16 shrink-0">${e.time}</span>
+                        <span class="${style.color} font-medium text-xs w-16 shrink-0">${style.label}</span>
+                        <span class="text-gray-300">
+                            <span class="font-mono text-xs">${e.peer_id}</span>
+                            <span class="text-gray-600 mx-1">→</span>
+                            <span class="text-gray-500 text-xs">${e.ip}:${e.port}</span>
+                            <span class="text-gray-600 mx-1">|</span>
+                            <span class="text-gray-500 text-xs">swarm ${e.info_hash}</span>
+                        </span>
+                        ${e.extra ? `<span class="text-xs text-gray-500">(${e.extra})</span>` : ""}
+                    </div>`;
+                }
+
+                container.innerHTML = html;
+            });
+    }
+
+    // ── Main Loop: cập nhật tất cả mỗi 2 giây ──
+    function updateAll() {
+        updateStatus();
+        updateSwarms();
+        updateEvents();
+    }
+
+    // Gọi ngay lần đầu, sau đó lặp lại
+    updateAll();
+    setInterval(updateAll, REFRESH_INTERVAL);
+    </script>
+
+</body>
+</html>

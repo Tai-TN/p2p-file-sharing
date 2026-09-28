@@ -1,16 +1,22 @@
 
 import os, sys, time, random, hashlib
 from storage.metainfo import load_metainfo
+from web.peer_web import start_peer_web
 from storage.piece_manager import PieceManager
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Cấu hình ──
 TRACKER_HOST = "127.0.0.1"
 TRACKER_PORT = 8000
-LEECHER_PORT = 6882
+LEECHER_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6882
+WEB_PORT = 9002 if LEECHER_PORT == 6882 else LEECHER_PORT + 2000
 
-META_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_workspace", "shared", "lofi_music.meta.json")
+META_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_workspace", "shared", "game.meta.json")
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_workspace", "downloads")
 
 def main():
@@ -39,8 +45,10 @@ def main():
     engine = TransferEngine(peer_id=peer_id, tracker_host=TRACKER_HOST,
                             tracker_port=TRACKER_PORT, listen_port=LEECHER_PORT,
                             piece_manager=pm, max_workers=4)
-
-    print(f"Leecher [{peer_id}] đang kết nối Tracker và tìm Seeder...\n")
+    
+    start_peer_web(peer_id_or_pm=peer_id, piece_manager=pm, engine=engine, peer_node=node, port=WEB_PORT)
+    print(f"----- Leecher [{peer_id}] dang ket noi Tracker va tim Seeder -----")
+    print(f"----- Dashboard: http://127.0.0.1:{WEB_PORT} -----\n")
 
     #  Bắt đầu tải
     start_time = time.time()

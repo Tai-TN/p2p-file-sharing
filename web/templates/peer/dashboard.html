@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Peer Node Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+        .piece-box {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            display: inline-block;
+            margin: 1.5px;
+            transition: all 0.2s ease;
+        }
+        .piece-owned { background-color: #22c55e; }
+        .piece-missing { background-color: #374151; }
+        .piece-inflight {
+            background-color: #eab308;
+            animation: pulse-glow 1s infinite alternate;
+        }
+        @keyframes pulse-glow {
+            from { opacity: 0.6; transform: scale(0.95); }
+            to { opacity: 1; transform: scale(1.1); }
+        }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+    <!-- ══ NAVBAR ══ -->
+    <nav class="bg-gray-900 border-b border-gray-800 px-6 py-4 sticky top-0 z-50 shadow-md">
+        <div class="flex items-center justify-between max-w-6xl mx-auto">
+            <div class="flex items-center gap-3">
+                <span class="text-2xl" id="nav-icon">📥</span>
+                <div>
+                    <div class="flex items-center gap-2">
+                        <h1 class="text-lg font-bold" id="peer-id-display">Peer Node</h1>
+                        <span id="role-badge" class="text-xs bg-purple-900 text-purple-300 font-semibold px-2 py-0.5 rounded-full">Leecher</span>
+                        <span id="online-badge" class="text-xs bg-green-900/70 text-green-400 px-2 py-0.5 rounded-full">● Online</span>
+                    </div>
+                    <div class="text-xs text-gray-400">
+                        Cổng lắng nghe P2P: <span id="listen-port" class="font-mono text-gray-200">6882</span>
+                    </div>
+                </div>
+            </div>
+            <div class="text-right text-xs text-gray-400">
+                <div>Uptime: <span id="uptime" class="text-gray-200 font-mono">0h 0m 0s</span></div>
+                <div class="text-gray-500">Cập nhật mỗi 1.5s</div>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-6xl mx-auto p-6 space-y-6">
+
+        <!-- ══ STAT CARDS ══ -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Tiến Độ Tải</div>
+                <div class="text-3xl font-bold mt-2 text-green-400" id="stat-progress">0%</div>
+                <div class="text-xs text-gray-400 mt-1" id="stat-pieces-count">0 / 0 mảnh</div>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Tốc Độ Tải</div>
+                <div class="text-3xl font-bold mt-2 text-blue-400" id="stat-speed">0.0 <span class="text-sm font-normal text-gray-400">KB/s</span></div>
+                <div class="text-xs text-gray-400 mt-1" id="stat-inflight">0 mảnh đang xin</div>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Peers Kết Nối</div>
+                <div class="text-3xl font-bold mt-2 text-purple-400" id="stat-peers">0</div>
+                <div class="text-xs text-gray-400 mt-1" id="stat-peers-detail">0 seeder khả dụng</div>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+                <div class="text-gray-500 text-xs font-semibold uppercase tracking-wider">Upload / Seeding</div>
+                <div class="text-3xl font-bold mt-2 text-emerald-400" id="stat-upload">0</div>
+                <div class="text-xs text-gray-400 mt-1">Kết nối đang phục vụ</div>
+            </div>
+        </div>
+
+        <!-- ══ FILE TRANSFER OVERVIEW ══ -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+            <div class="flex flex-col md:flex-row md:items-center justify-between pb-3 mb-3 border-b border-gray-800 gap-2">
+                <div class="flex items-center gap-3">
+                    <span class="text-3xl">📁</span>
+                    <div>
+                        <div class="font-bold text-base text-gray-100" id="file-name">Đang tải file...</div>
+                        <div class="text-xs text-gray-400">
+                            Dung lượng: <span id="file-size" class="text-gray-300 font-medium">0 MB</span> ·
+                            Kích thước mỗi mảnh: <span id="piece-size" class="text-gray-300 font-medium">512 KB</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="text-right">
+                    <span id="complete-pill" class="text-xs px-3 py-1 rounded-full bg-yellow-900/50 text-yellow-300 font-medium border border-yellow-700/50">
+                        ⏳ Đang tải dữ liệu
+                    </span>
+                </div>
+            </div>
+
+            <!-- Progress Bar -->
+            <div class="space-y-1.5 mt-4">
+                <div class="flex justify-between text-xs text-gray-400">
+                    <span id="progress-text">Tiến độ hoàn thành: 0%</span>
+                    <span id="bytes-text">0 / 0 MB</span>
+                </div>
+                <div class="w-full bg-gray-800 rounded-full h-3 overflow-hidden p-0.5 border border-gray-700">
+                    <div id="progress-bar" class="bg-gradient-to-r from-blue-500 to-green-500 h-full rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ══ PIECE MAP (BITFIELD VISUALIZER) ══ -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="font-semibold text-sm flex items-center gap-2">
+                    🧩 Bản Đồ Mảnh File (Piece Map)
+                    <span class="text-xs text-gray-400 font-normal" id="piece-summary">0 / 0</span>
+                </h2>
+                <div class="flex items-center gap-4 text-xs">
+                    <div class="flex items-center gap-1.5">
+                        <span class="w-3 h-3 rounded-sm piece-owned inline-block"></span>
+                        <span class="text-gray-400">Đã có</span>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                        <span class="w-3 h-3 rounded-sm piece-inflight inline-block"></span>
+                        <span class="text-gray-400">Đang tải</span>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                        <span class="w-3 h-3 rounded-sm piece-missing inline-block"></span>
+                        <span class="text-gray-400">Còn thiếu</span>
+                    </div>
+                </div>
+            </div>
+
+            <div id="piece-grid" class="max-h-56 overflow-y-auto p-3 bg-gray-950/70 rounded-lg border border-gray-800 leading-none">
+                <p class="text-xs text-gray-500 text-center py-4">Đang nạp bitfield...</p>
+            </div>
+        </div>
+
+        <!-- ══ CONNECTED PEERS TABLE ══ -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+            <h2 class="font-semibold text-sm mb-4 flex items-center gap-2">
+                👥 Danh Sách Peers Đang Trao Đổi
+                <span class="text-xs text-gray-500 font-normal">(kết nối song song)</span>
+            </h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-xs text-gray-500 uppercase tracking-wider border-b border-gray-800">
+                            <th class="text-left py-2 font-medium">Peer ID</th>
+                            <th class="text-left py-2 font-medium">IP : Cổng</th>
+                            <th class="text-left py-2 font-medium">Vai Trò</th>
+                            <th class="text-left py-2 font-medium">Số Mảnh Sở Hữu</th>
+                            <th class="text-left py-2 font-medium">Tiến Độ Peer</th>
+                            <th class="text-left py-2 font-medium">Trạng Thái</th>
+                        </tr>
+                    </thead>
+                    <tbody id="peers-tbody">
+                        <tr>
+                            <td colspan="6" class="py-6 text-center text-gray-500 text-xs">
+                                Chưa có Peer nào được kết nối trực tiếp.
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ══ REAL-TIME ACTIVITY LOG ══ -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm">
+            <h2 class="font-semibold text-sm mb-4 flex items-center gap-2">
+                📋 Nhật Ký Hoạt Động (Live Transfer Log)
+                <span class="text-xs text-gray-500 font-normal">— Cập nhật tức thời</span>
+            </h2>
+            <div id="logs-container" class="space-y-1.5 max-h-72 overflow-y-auto font-mono text-xs">
+                <p class="text-gray-500 py-4 text-center">Chưa có sự kiện chuyển dữ liệu nào.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ══ JAVASCRIPT LOGIC ══ -->
+    <script>
+    const REFRESH_INTERVAL = 1500; // 1.5 giây
+    let lastLogCount = 0;
+
+    function formatBytes(bytes) {
+        if (!bytes || bytes === 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB"];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
+    }
+
+    function formatSpeed(bytesPerSec) {
+        if (!bytesPerSec || bytesPerSec === 0) return "0.0 KB/s";
+        if (bytesPerSec >= 1024 * 1024) {
+            return (bytesPerSec / (1024 * 1024)).toFixed(2) + " MB/s";
+        }
+        return (bytesPerSec / 1024).toFixed(1) + " KB/s";
+    }
+
+    // ── Cập nhật Status ──
+    function updateStatus() {
+        fetch("/api/status")
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById("peer-id-display").textContent = data.peer_id || "Peer Node";
+                document.getElementById("listen-port").textContent = data.listen_port;
+                document.getElementById("uptime").textContent = data.uptime;
+
+                // Role badge
+                const roleBadge = document.getElementById("role-badge");
+                const navIcon = document.getElementById("nav-icon");
+                if (data.is_complete || data.role === "Seeder") {
+                    roleBadge.textContent = "🌱 Seeder";
+                    roleBadge.className = "text-xs bg-blue-900 text-blue-300 font-semibold px-2 py-0.5 rounded-full";
+                    navIcon.textContent = "🌱";
+                } else {
+                    roleBadge.textContent = "📥 Leecher";
+                    roleBadge.className = "text-xs bg-purple-900 text-purple-300 font-semibold px-2 py-0.5 rounded-full";
+                    navIcon.textContent = "📥";
+                }
+
+                // Stat Cards
+                document.getElementById("stat-progress").textContent = data.progress + "%";
+                document.getElementById("stat-pieces-count").textContent = `${data.owned_pieces} / ${data.total_pieces} mảnh`;
+                document.getElementById("stat-speed").textContent = formatSpeed(data.download_speed);
+                document.getElementById("stat-inflight").textContent = `${data.in_flight_count} mảnh đang tải`;
+                document.getElementById("stat-peers").textContent = data.connected_peers_count;
+                document.getElementById("stat-peers-detail").textContent = `${data.connected_peers_count} peer kết nối`;
+                document.getElementById("stat-upload").textContent = data.active_upload_sockets;
+
+                // File Overview
+                document.getElementById("file-name").textContent = data.file_name;
+                document.getElementById("file-size").textContent = formatBytes(data.file_size);
+                document.getElementById("piece-size").textContent = formatBytes(data.piece_length);
+
+                const downloadedBytes = (data.progress / 100) * data.file_size;
+                document.getElementById("progress-text").textContent = `Tiến độ: ${data.progress}% (${data.owned_pieces}/${data.total_pieces} pieces)`;
+                document.getElementById("bytes-text").textContent = `${formatBytes(downloadedBytes)} / ${formatBytes(data.file_size)}`;
+                document.getElementById("progress-bar").style.width = data.progress + "%";
+
+                const pill = document.getElementById("complete-pill");
+                if (data.is_complete) {
+                    pill.textContent = "✅ Hoàn tất 100% (Đang Seeding)";
+                    pill.className = "text-xs px-3 py-1 rounded-full bg-green-900/60 text-green-300 font-medium border border-green-700/50";
+                } else {
+                    pill.textContent = `⏳ Đang tải (${data.progress}%)`;
+                    pill.className = "text-xs px-3 py-1 rounded-full bg-yellow-900/50 text-yellow-300 font-medium border border-yellow-700/50";
+                }
+            })
+            .catch(err => {
+                const onlineBadge = document.getElementById("online-badge");
+                onlineBadge.textContent = "● Mất kết nối";
+                onlineBadge.className = "text-xs bg-red-900 text-red-400 px-2 py-0.5 rounded-full";
+            });
+    }
+
+    // ── Cập nhật Piece Map (Bitfield) ──
+    function updatePieces() {
+        fetch("/api/pieces")
+            .then(res => res.json())
+            .then(data => {
+                const grid = document.getElementById("piece-grid");
+                const inFlightSet = new Set(data.in_flight || []);
+                const bitfield = data.bitfield || [];
+                const total = data.total || bitfield.length;
+                const owned = data.owned || 0;
+
+                document.getElementById("piece-summary").textContent = `(${owned}/${total} mảnh đã có - ${((owned/total)*100).toFixed(1)}%)`;
+
+                if (bitfield.length === 0) {
+                    grid.innerHTML = '<p class="text-xs text-gray-500 text-center py-4">Chưa có thông tin mảnh.</p>';
+                    return;
+                }
+
+                let html = "";
+                for (let i = 0; i < bitfield.length; i++) {
+                    let cls = "piece-missing";
+                    let title = `Mảnh #${i}: Chưa có`;
+
+                    if (bitfield[i]) {
+                        cls = "piece-owned";
+                        title = `Mảnh #${i}: Đã tải & verify SHA-256`;
+                    } else if (inFlightSet.has(i)) {
+                        cls = "piece-inflight";
+                        title = `Mảnh #${i}: Đang tải về...`;
+                    }
+
+                    html += `<div class="piece-box ${cls}" title="${title}"></div>`;
+                }
+
+                grid.innerHTML = html;
+            });
+    }
+
+    // ── Cập nhật Peers Table ──
+    function updatePeers() {
+        fetch("/api/peers")
+            .then(res => res.json())
+            .then(data => {
+                const tbody = document.getElementById("peers-tbody");
+                const peers = data.download_peers || [];
+
+                if (peers.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-gray-500 text-xs">Chưa có Peer nào được kết nối trực tiếp.</td></tr>`;
+                    return;
+                }
+
+                let html = "";
+                for (const p of peers) {
+                    const roleBadge = p.role === "Seeder"
+                        ? '<span class="bg-blue-900/60 text-blue-300 px-2 py-0.5 rounded text-xs">🌱 Seeder</span>'
+                        : '<span class="bg-purple-900/60 text-purple-300 px-2 py-0.5 rounded text-xs">📥 Leecher</span>';
+
+                    html += `
+                    <tr class="border-t border-gray-800 hover:bg-gray-800/40">
+                        <td class="py-2.5 font-mono text-xs text-gray-300 font-semibold">${p.peer_id}</td>
+                        <td class="py-2.5 font-mono text-xs text-gray-400">${p.ip}:${p.port}</td>
+                        <td class="py-2.5">${roleBadge}</td>
+                        <td class="py-2.5 text-xs text-gray-300">${p.owned_pieces} / ${p.total_pieces}</td>
+                        <td class="py-2.5">
+                            <div class="flex items-center gap-2">
+                                <div class="w-16 bg-gray-800 rounded-full h-1.5 overflow-hidden">
+                                    <div class="bg-blue-500 h-1.5 rounded-full" style="width: ${p.percentage}%"></div>
+                                </div>
+                                <span class="text-xs text-gray-400">${p.percentage}%</span>
+                            </div>
+                        </td>
+                        <td class="py-2.5">
+                            <span class="text-xs text-green-400 flex items-center gap-1">
+                                <span class="w-1.5 h-1.5 rounded-full bg-green-400 inline-block"></span> Active
+                            </span>
+                        </td>
+                    </tr>`;
+                }
+
+                tbody.innerHTML = html;
+            });
+    }
+
+    // ── Cập nhật Nhật Ký (Live Activity Log) ──
+    function updateLogs() {
+        fetch("/api/logs")
+            .then(res => res.json())
+            .then(logs => {
+                const container = document.getElementById("logs-container");
+                if (!logs || logs.length === 0) {
+                    container.innerHTML = '<p class="text-gray-500 py-4 text-center text-xs">Chưa có sự kiện nào.</p>';
+                    return;
+                }
+
+                let html = "";
+                for (let i = 0; i < logs.length; i++) {
+                    const l = logs[i];
+                    let icon = "ℹ️";
+                    let color = "text-gray-300";
+                    let text = "";
+
+                    if (l.type === "piece_downloaded") {
+                        icon = "🟢";
+                        color = "text-green-400";
+                        text = `Đã tải mảnh #${l.piece_index} (${formatBytes(l.size)}) từ ${l.from_peer} [${l.progress}%]`;
+                    } else if (l.type === "piece_served") {
+                        icon = "📤";
+                        color = "text-blue-400";
+                        text = `Gửi mảnh #${l.piece_index} phục vụ peer tại ${l.to_addr}`;
+                    } else if (l.type === "peer_connected") {
+                        icon = "🔗";
+                        color = "text-cyan-400";
+                        text = `Kết nối thành công với peer ${l.peer_id || l.addr}`;
+                    } else if (l.type === "completed") {
+                        icon = "🎉";
+                        color = "text-emerald-400 font-bold";
+                        text = l.message;
+                    } else if (l.type === "peer_disconnected") {
+                        icon = "⚠️";
+                        color = "text-yellow-400";
+                        text = `Ngắt kết nối với peer ${l.peer_id} (${l.reason})`;
+                    } else {
+                        text = JSON.stringify(l);
+                    }
+
+                    html += `
+                    <div class="flex items-center gap-2 py-1 px-2 rounded hover:bg-gray-800/30 ${i === 0 ? 'fade-in bg-gray-800/20' : ''}">
+                        <span>${icon}</span>
+                        <span class="text-gray-500 text-[11px] w-14 shrink-0 font-mono">${l.time || ''}</span>
+                        <span class="${color}">${text}</span>
+                    </div>`;
+                }
+
+                container.innerHTML = html;
+            });
+    }
+
+    function updateAll() {
+        updateStatus();
+        updatePieces();
+        updatePeers();
+        updateLogs();
+    }
+
+    // Khởi chạy ngay và lặp lại định kỳ
+    updateAll();
+    setInterval(updateAll, REFRESH_INTERVAL);
+    </script>
+</body>
+</html>

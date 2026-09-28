@@ -9,6 +9,12 @@ from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
 from storage.piece_manager import PieceManager
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
+from web.peer_web import start_peer_web   
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 # ── Cấu hình ──
 TRACKER_HOST = "127.0.0.1"
@@ -16,8 +22,8 @@ TRACKER_PORT = 8000
 SEEDER_PORT  = int(sys.argv[1]) if len(sys.argv) > 1 else 6881
 
 # Đường dẫn file muốn chia sẻ 
-SOURCE_FILE = "/home/taitn/Downloads/ubuntu-26.04-desktop-amd64.iso"
-META_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_workspace", "shared", "lofi_music.meta.json")
+SOURCE_FILE = "C:/Users/Lenovo/Downloads/BvN-Online-Setup.exe"
+META_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_workspace", "shared", "game.meta.json")
 
 def main():
     # Kiểm tra file nguồn
@@ -50,7 +56,11 @@ def main():
                             tracker_port=TRACKER_PORT, listen_port=SEEDER_PORT, piece_manager=pm)
     engine._announce_to_tracker(event="started")
 
-    print(f" Seeder [{peer_id}] đang chạy tại cổng {SEEDER_PORT}")
+    web_port = 9001 if SEEDER_PORT == 6881 else SEEDER_PORT + 2000
+    start_peer_web(peer_id_or_pm=peer_id, piece_manager=pm, engine=engine, peer_node=node, port=web_port)
+
+    print(f"----- Seeder [{peer_id}] dang chay tai cong {SEEDER_PORT} -----")
+    print(f"----- Dashboard: http://127.0.0.1:{web_port} -----\n")
 
     try:
         while True:
@@ -59,7 +69,7 @@ def main():
     except KeyboardInterrupt:
         engine._announce_to_tracker(event="stopped")
         node.stop()
-        print("\nSeeder đã dừng.")
+        print("\nSeeder da dung.")
 
 if __name__ == "__main__":
     main()

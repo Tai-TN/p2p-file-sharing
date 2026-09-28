@@ -5,6 +5,7 @@ import socket
 import base64
 import random
 import threading
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 from storage.piece_manager import PieceManager
 from protocol.messages import (
@@ -45,6 +46,21 @@ class TransferEngine:
         # Đường dẫn file lưu vết tiến độ resume
         self.progress_file = f"{piece_manager.target_file_path}.progress.json"
 
+        # Log transfer cho Web UI
+        self.transfer_log: deque = deque(maxlen=200)
+
+        # Theo dõi tốc độ download (timestamp, bytes)
+        self.speed_history: deque = deque(maxlen=60)
+        self.total_downloaded_bytes = 0
+
+    def get_download_speed(self) -> float:
+        """Tính tốc độ download tức thời trong 3 giây gần nhất (Bytes/s)."""
+        now = time.time()
+        recent = [b for t, b in self.speed_history if now - t <= 3.0]
+        if not recent:
+            return 0.0
+        return sum(recent) / 3.0
+
     def start_download(self, peer_node=None) -> bool:
         """Bắt đầu quá trình tải tập tin song song."""
         self.is_running = True
@@ -73,6 +89,11 @@ class TransferEngine:
 
         if self.piece_manager.is_complete():
             print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
+            self.transfer_log.append({
+                "time": time.strftime("%H:%M:%S"),
+                "type": "completed",
+                "message": "Đã tải hoàn tất 100%! Bắt đầu chia sẻ (Seeder)."
+            })
             self._announce_to_tracker(event="completed")
             self._remove_progress_file()
             return True
@@ -151,6 +172,14 @@ class TransferEngine:
                             "ip": ip,
                             "port": port
                         }
+                        self.transfer_log.append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "type": "peer_connected",
+                            "peer_id": p_id,
+                            "ip": ip,
+                            "port": port,
+                            "pieces_count": sum(bitfield) if bitfield else 0
+                        })
                         print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
@@ -180,6 +209,7 @@ class TransferEngine:
                 peer_bitfields = {p_id: info["bitfield"] for p_id, info in self.connected_peers.items()}
                 missing = [p for p in self.piece_manager.missing_pieces() if p not in self.in_flight_pieces]
 
+            # có thể bị lặp vô hạn nếu ko có peer nào kết nối
             if not missing or not peer_bitfields:
                 # Nếu chưa có peer kết nối, thử hỏi lại Tracker
                 peers = self._announce_to_tracker()
@@ -242,6 +272,17 @@ class TransferEngine:
 
                     # Ghi mảnh xuống đĩa và kiểm tra SHA-256
                     if self.piece_manager.write_piece(piece_index, piece_data):
+                        piece_size = len(piece_data)
+                        self.total_downloaded_bytes += piece_size
+                        self.speed_history.append((time.time(), piece_size))
+                        self.transfer_log.append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "type": "piece_downloaded",
+                            "piece_index": piece_index,
+                            "from_peer": p_id,
+                            "size": piece_size,
+                            "progress": round(self.piece_manager.progress_percentage(), 1)
+                        })
                         print(f"[TransferEngine {self.peer_id}] 🟢 Đã tải & Verify thành công Piece {piece_index} từ Peer {p_id} ({self.piece_manager.progress_percentage():.1f}%)")
                         
                         # Phát tin nhắn HAVE đến tất cả các peer kết nối nếu có peer_node
@@ -250,6 +291,12 @@ class TransferEngine:
                         return True
         except Exception as e:
             # Ngắt kết nối peer bị lỗi
+            self.transfer_log.append({
+                "time": time.strftime("%H:%M:%S"),
+                "type": "peer_disconnected",
+                "peer_id": p_id,
+                "reason": str(e)
+            })
             with self.lock:
                 if p_id in self.connected_peers:
                     try:
