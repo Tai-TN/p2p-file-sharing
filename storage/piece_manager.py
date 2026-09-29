@@ -39,7 +39,8 @@ class PieceManager:
                     f.truncate(self.file_size)
 
         # Đọc và xác minh hash của từng mảnh trên đĩa
-        self.verify_all_pieces()
+        #self.verify_all_pieces()
+        
 
     def verify_all_pieces(self) -> None:
         """Xác minh toàn bộ các piece hiện có trên đĩa so với SHA-256 mong đợi."""

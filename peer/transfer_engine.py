@@ -49,6 +49,7 @@ class TransferEngine:
         """Bắt đầu quá trình tải tập tin song song."""
         self.is_running = True
         self.peer_node = peer_node
+        self._load_progress() # Dùng load_progress tránh việc verify lại toàn bộ hash -> Lâu lắc
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
@@ -288,6 +289,48 @@ class TransferEngine:
                 os.remove(self.progress_file)
             except Exception:
                 pass
+    
+    def _load_progress(self) -> None:
+        """
+        Khôi phục trạng thái tải, ưu tiên tốc độ: => có 3 trường hợp, có file progress, không có file progress
+        => Verify all piecce, mới khởi taoj => Mảng mặc định là False
+        """
+        target = self.piece_manager.target_file_path
+
+        # Trường hợp 1: Có file .progress.json
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, "r") as f:
+                    data = json.load(f)
+
+                if data.get("info_hash") != self.info_hash:
+                    raise ValueError("info_hash không khớp")
+
+                saved_bitfield = data.get("bitfield", [])
+                if len(saved_bitfield) != self.piece_manager.num_pieces:
+                    raise ValueError("Số mảnh không khớp")
+
+                # Khôi phục bitfield từ JSON — không cần đọc lại đĩa
+                self.piece_manager.bitfield = saved_bitfield
+                count = sum(1 for b in saved_bitfield if b)
+                print(f"[TransferEngine] Resume từ JSON: {count}/{self.piece_manager.num_pieces} mảnh "
+                      f"({self.piece_manager.progress_percentage():.1f}%)")
+                return
+
+            except Exception:
+                # JSON lỗi → rơi xuống trường hợp 2
+                pass
+
+        # Trường hợp 2: Không có JSON nhưng file đã tồn tại → quét lại
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            print(f"[TransferEngine] Không có file progress, đang quét lại SHA-256... (có thể mất vài phút)")
+            self.piece_manager.verify_all_pieces()
+            count = sum(1 for b in self.piece_manager.bitfield if b)
+            if count > 0:
+                print(f"[TransferEngine] Quét xong: tìm thấy {count}/{self.piece_manager.num_pieces} mảnh hợp lệ")
+
+        # Trường hợp 3: File mới rỗng → không cần làm gì (bitfield toàn False)
+
 
     def stop(self) -> None:
 

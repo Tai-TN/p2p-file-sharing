@@ -58,20 +58,20 @@ def main() -> None:
                 meta_path = os.path.join(SHARED_DIR, os.path.basename(src) + ".meta.json")
                 try:
                     client.share_file(src, meta_path)
-                    print(f"  ✓ Đang Seed: {os.path.basename(src)}")
-                    print(f"  → Metadata: {meta_path}")
+                    print(f"  - Đang Seed: {os.path.basename(src)}")
+                    print(f"  - Metadata: {meta_path}")
                 except Exception as e:
                     print(f"  Lỗi: {e}")
 
             elif choice == "2":
-                # ── Tải file (chạy ngầm, menu vẫn hoạt động bình thường) ──
+                # ── Tải file 
                 meta_path = input("Đường dẫn file .meta.json: ").strip().strip("'\"")
                 if not os.path.exists(meta_path):
                     print(f"  Lỗi: Không tìm thấy file metadata.")
                     continue
                 try:
                     client.download_file(meta_path, DOWNLOAD_DIR)
-                    print(f"  ✓ Đã bắt đầu tải ngầm — chọn mục 3 để xem tiến độ.")
+                    print(f"  - Đã bắt đầu tải ngầm — chọn mục 3 để xem tiến độ.")
                 except Exception as e:
                     print(f"  Lỗi: {e}")
 
