@@ -60,12 +60,16 @@ class TransferEngine:
         announce_thread = threading.Thread(target=self._periodic_announce, daemon=True)
         announce_thread.start()
 
+
         # Tạo và chạy luồng Worker Pool tải song song
         worker_threads = []
         for i in range(self.max_workers):
             t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
             t.start()
             worker_threads.append(t)
+
+
+        time_start = time.time()
 
         # Chờ cho tới khi tải xong 100% hoặc bị dừng
         # Lưu progress mỗi 10 giây thay vì mỗi 0.5s — tránh ghi JSON lớn liên tục
@@ -79,6 +83,14 @@ class TransferEngine:
 
         if self.piece_manager.is_complete():
             print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
+            elapsed   = time.time() - time_start
+            total_MB  = self.piece_manager.file_size / 1_048_576
+            speed_MBs = total_MB / elapsed if elapsed > 0 else 0
+            speed_Mbs = speed_MBs * 8
+            print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%!")
+            print(f"  Thời gian : {elapsed:.2f} giây")
+            print(f"  Kích thước: {total_MB:.2f} MB")
+            print(f"  Tốc độ TB : {speed_MBs:.2f} MB/s  ({speed_Mbs:.1f} Mbps)")
             self._announce_to_tracker(event="completed")
             self._remove_progress_file()
             return True
