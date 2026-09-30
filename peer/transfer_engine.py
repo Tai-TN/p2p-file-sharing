@@ -148,31 +148,43 @@ class TransferEngine:
     def _update_peer_connections(self, peers_list: List[Dict]) -> None:
         """Kết nối tới các Peer mới trong danh sách thu thập từ Tracker."""
         for p_info in peers_list:
-            p_id = p_info["peer_id"]
-            ip = p_info["ip"]
-            port = p_info["port"]
+            p_id = p_info.get("peer_id")
+            ip   = p_info.get("ip")
+            port = p_info.get("port")
 
-            # Giữ lock trong suốt quá trình kiểm tra + kết nối
-            # để tránh nhiều worker cùng kết nối trùng tới 1 peer
+            if not p_id or not ip or not port:
+                continue
+
+            # Kiểm tra nhanh trong lock (không làm network ở đây)
             with self.lock:
-                if p_id in self.connected_peers:
+                if p_id in self.connected_peers or p_id == self.peer_id:
                     continue
 
-                # Thử mở kết nối socket tới Peer mới này (trong lock)
-                sock = self._connect_and_handshake(ip, port)
-                if sock:
-                    # Nhận BITFIELD từ Peer
-                    bitfield_msg = recv_msg(sock)
-                    if bitfield_msg and bitfield_msg.get("type") == MessageType.BITFIELD.value:
-                        bitfield = bitfield_msg.get("bitfield", [])
-                        self.connected_peers[p_id] = {
-                            "sock": sock,
-                            "sock_lock": threading.Lock(),  # Lock riêng cho mỗi peer socket
-                            "bitfield": bitfield,
-                            "ip": ip,
-                            "port": port
-                        }
-                        print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
+            # Làm network NGOÀI lock — worker khác vẫn tải bình thường trong lúc này
+            sock = self._connect_and_handshake(ip, port)
+            if not sock:
+                continue
+
+            bitfield_msg = recv_msg(sock)
+            if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
+                sock.close()
+                continue
+
+            bitfield = bitfield_msg.get("bitfield", [])
+
+            # Thêm peer vào danh sách (trong lock, nhanh)
+            with self.lock:
+                if p_id not in self.connected_peers:
+                    self.connected_peers[p_id] = {
+                        "sock":      sock,
+                        "sock_lock": threading.Lock(),
+                        "bitfield":  bitfield,
+                        "ip":        ip,
+                        "port":      port
+                    }
+                    print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
+                else:
+                    sock.close()  # Worker khác vừa kết nối peer này → đóng socket thừa
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
         """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
