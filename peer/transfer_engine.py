@@ -23,23 +23,25 @@ class TransferEngine:
     Động cơ chuyển tải file P2P: Quản lý việc kết nối đến Tracker, kết nối trực tiếp đến các Peer khác,
     và điều phối các Worker Thread để tải song song các mảnh (Pieces) còn thiếu.
     """
-    def __init__(self, peer_id: str, tracker_host: str, tracker_port: int, listen_port: int, piece_manager: PieceManager, max_workers: int = 4):
+    def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
+                 listen_port: int, piece_manager: PieceManager,
+                 max_workers: int = 4, my_ip: str = ""):
         self.peer_id = peer_id
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
         self.listen_port = listen_port
         self.piece_manager = piece_manager
         self.max_workers = max_workers
+        self.my_ip = my_ip          # IP thực của máy — báo cho Tracker để peer khác kết nối đúng chỗ
         self.info_hash = piece_manager.metainfo["info_hash"]
 
         self.is_running = False
         self.lock = threading.Lock()
 
-        # Quản lý danh sách các peer đã kết nối:
-        # { peer_id: { "sock": socket, "sock_lock": Lock, "bitfield": list[bool], "ip": str, "port": int } }
+        # Quản lý danh sách các peer đã kết nối
         self.connected_peers: Dict[str, Dict] = {}
-        
-        # Đánh dấu các piece đang được 1 luồng worker nào đó tải (để tránh 2 luồng tải trùng piece)
+
+        # Đánh dấu các piece đang được tải (tránh 2 luồng tải trùng piece)
         self.in_flight_pieces: set = set()
 
         # Đường dẫn file lưu vết tiến độ resume
@@ -111,6 +113,7 @@ class TransferEngine:
                 info_hash=self.info_hash,
                 peer_id=self.peer_id,
                 port=self.listen_port,
+                ip=self.my_ip,          # IP thực để Tracker lưu đúng địa chỉ
                 event=event,
                 downloaded=downloaded_bytes,
                 left=left_bytes

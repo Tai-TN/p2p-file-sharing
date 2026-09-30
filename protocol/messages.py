@@ -68,11 +68,13 @@ def recv_msg(sock) -> Optional[Dict[str, Any]]:
 
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 
-def create_announce_msg(info_hash: str, peer_id: str, port: int, event: str = "started", downloaded: int = 0, left: int = 0) -> Dict[str, Any]:
+def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
+                        event: str = "started", downloaded: int = 0, left: int = 0) -> Dict[str, Any]:
     return {
         "type": MessageType.ANNOUNCE.value,
         "info_hash": info_hash,
         "peer_id": peer_id,
+        "ip": ip,           # IP thực của máy — để Tracker báo đúng cho peer khác kết nối vào
         "port": port,
         "event": event,
         "downloaded": downloaded,

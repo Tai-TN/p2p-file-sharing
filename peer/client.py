@@ -1,4 +1,5 @@
 import os
+import socket
 import random
 import threading
 from typing import Dict, List, Optional
@@ -7,6 +8,18 @@ from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
 from storage.piece_manager import PieceManager
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
+
+
+def get_local_ip() -> str:
+    """Lấy IP thực của máy trong mạng LAN."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 class P2PClient:
@@ -23,17 +36,20 @@ class P2PClient:
       PeerNode tiếp tục phục vụ upload mà không cần làm thêm gì.
     """
 
-    def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881, tracker_host: str = "127.0.0.1", tracker_port: int = 8000,):
+    def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
+                 tracker_host: str = "127.0.0.1", tracker_port: int = 8000):
         self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
         self.listen_port = listen_port
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
 
-        # Server TCP duy nhất
-        self.node = PeerNode(peer_id=self.peer_id, host="127.0.0.1", port=listen_port)
+        # IP thực của máy — báo cho Tracker để peer khác biết kết nối vào đâu
+        self.my_ip = get_local_ip()
+
+        # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi máy trong LAN
+        self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port)
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
-        # task_dict = { "name", "pm", "engine", "type", "status" }
         self._tasks: Dict[str, Dict] = {}
         self._lock = threading.Lock()
 
@@ -41,7 +57,9 @@ class P2PClient:
     def start(self) -> None:
         """Mở cổng TCP và sẵn sàng nhận kết nối từ Peer khác."""
         self.node.start_listening()
-        print(f"[P2PClient {self.peer_id}] Đã khởi động tại cổng {self.listen_port}")
+        print(f"[P2PClient {self.peer_id}] Đã khởi động")
+        print(f"  IP máy này : {self.my_ip}:{self.listen_port}")
+        print(f"  Tracker    : {self.tracker_host}:{self.tracker_port}")
 
     def stop(self) -> None:
         """Dừng tất cả engine, hủy đăng ký với Tracker, đóng kết nối."""
@@ -111,6 +129,7 @@ class P2PClient:
             tracker_port=self.tracker_port,
             listen_port=self.listen_port,
             piece_manager=pm,
+            my_ip=self.my_ip,
         )
         engine._announce_to_tracker(event="started")
 
@@ -159,6 +178,7 @@ class P2PClient:
             listen_port=self.listen_port,
             piece_manager=pm,
             max_workers=4,
+            my_ip=self.my_ip,
         )
 
         with self._lock:

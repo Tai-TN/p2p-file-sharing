@@ -71,11 +71,16 @@ class TrackerServer:
                 downloaded = msg.get("downloaded", 0)
                 left = msg.get("left", 0)
 
+                # Ưu tiên IP do peer tự báo (IP thật trong LAN).
+                # Nếu không có, dùng IP từ kết nối TCP (fallback).
+                announced_ip = msg.get("ip", "").strip()
+                peer_ip = announced_ip if announced_ip else client_ip
+
                 # Đăng ký thông tin peer
                 self.state.register_peer(
                     info_hash=info_hash,
                     peer_id=peer_id,
-                    ip=client_ip,
+                    ip=peer_ip,
                     port=peer_port,
                     downloaded=downloaded,
                     left=left,
