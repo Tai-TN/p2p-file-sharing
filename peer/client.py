@@ -93,8 +93,11 @@ class P2PClient:
                 print(f"[P2PClient] '{meta['info']['name']}' đã được đăng ký rồi.")
                 return info_hash
 
-        # Kiểm tra tính toàn vẹn file nguồn
         pm = PieceManager(source_file, meta)
+
+        # Kiểm tra tính toàn vẹn file nguồn
+        print(f"  Đang kiểm tra tính toàn vẹn file (SHA-256)...")
+        pm.verify_all_pieces()
         if not pm.is_complete():
             raise ValueError("File nguồn không đầy đủ hoặc bị hỏng SHA-256!")
 
