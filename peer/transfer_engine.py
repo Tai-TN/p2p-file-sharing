@@ -146,7 +146,7 @@ class TransferEngine:
                 self._update_peer_connections(peers)
 
     def _update_peer_connections(self, peers_list: List[Dict]) -> None:
-        """Kết nối tới các Peer mới trong danh sách thu thập từ Tracker."""
+        """Khám phá Peer mới từ Tracker và lưu thông tin bitfield."""
         for p_info in peers_list:
             p_id = p_info.get("peer_id")
             ip   = p_info.get("ip")
@@ -155,36 +155,35 @@ class TransferEngine:
             if not p_id or not ip or not port:
                 continue
 
-            # Kiểm tra nhanh trong lock (không làm network ở đây)
+            # Kiểm tra nhanh trong lock
             with self.lock:
                 if p_id in self.connected_peers or p_id == self.peer_id:
                     continue
 
-            # Làm network NGOÀI lock — worker khác vẫn tải bình thường trong lúc này
+            # Kết nối probe NGOÀI lock — chỉ để lấy bitfield
             sock = self._connect_and_handshake(ip, port)
             if not sock:
                 continue
 
             bitfield_msg = recv_msg(sock)
+            sock.close()   # Đóng ngay — mỗi worker sẽ tự tạo connection riêng của mình
+
             if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
-                sock.close()
                 continue
 
             bitfield = bitfield_msg.get("bitfield", [])
 
-            # Thêm peer vào danh sách (trong lock, nhanh)
             with self.lock:
                 if p_id not in self.connected_peers:
+                    # Chỉ lưu ip/port/bitfield — không lưu socket (mỗi worker tự kết nối riêng)
                     self.connected_peers[p_id] = {
-                        "sock":      sock,
-                        "sock_lock": threading.Lock(),
-                        "bitfield":  bitfield,
-                        "ip":        ip,
-                        "port":      port
+                        "ip":      ip,
+                        "port":    port,
+                        "bitfield": bitfield
                     }
-                    print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
-                else:
-                    sock.close()  # Worker khác vừa kết nối peer này → đóng socket thừa
+                    have_count = sum(1 for b in bitfield if b)
+                    print(f"[TransferEngine {self.peer_id}] Biết Peer {p_id} ({ip}:{port}) "
+                          f"| {have_count}/{len(bitfield)} mảnh")
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
         """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
@@ -206,42 +205,54 @@ class TransferEngine:
             return None
 
     def _worker_loop(self, worker_id: int) -> None:
-        """Vòng lặp làm việc của Worker Thread: Chọn mảnh hiếm nhất và xin dữ liệu từ Peer."""
+        """Vòng lặp của Worker Thread. Mỗi worker có bộ connection riêng — không tranh socket với nhau."""
+        # Dict connection riêng của worker này: { peer_id: socket }
+        my_conns: Dict[str, socket.socket] = {}
+
         while self.is_running and not self.piece_manager.is_complete():
-            # Kiểm tra và cập nhật danh sách peer
             with self.lock:
                 peer_bitfields = {p_id: info["bitfield"] for p_id, info in self.connected_peers.items()}
                 missing = [p for p in self.piece_manager.missing_pieces() if p not in self.in_flight_pieces]
 
             if not missing or not peer_bitfields:
-                # Nếu chưa có peer kết nối, thử hỏi lại Tracker
                 peers = self._announce_to_tracker()
                 if peers:
                     self._update_peer_connections(peers)
                 time.sleep(2.0)
                 continue
 
-            # Sử dụng thuật toán Rarest-First để chọn mảnh tiếp theo
             target_piece = choose_next_piece(missing, peer_bitfields, strategy="rarest_first")
             if target_piece is None:
                 time.sleep(0.5)
                 continue
 
-            # Đánh dấu mảnh này đang được luồng worker_id xử lý
+            # Claim piece — check + add trong cùng 1 lock
             with self.lock:
+                if target_piece in self.in_flight_pieces:
+                    continue
                 self.in_flight_pieces.add(target_piece)
 
-            # Tìm Peer sở hữu piece này để xin
-            success = self._download_piece_from_any_peer(target_piece)
-            
+            # Tải mảnh bằng connection riêng của worker này
+            success = self._download_piece(target_piece, my_conns)
+
             with self.lock:
-                self.in_flight_pieces.remove(target_piece)
+                self.in_flight_pieces.discard(target_piece)
 
             if not success:
                 time.sleep(0.5)
 
-    def _download_piece_from_any_peer(self, piece_index: int) -> bool:
-        """Tìm Peer có mảnh piece_index và gửi tin nhắn REQUEST."""
+        # Dọn dẹp connection khi worker thoát
+        for sock in my_conns.values():
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _download_piece(self, piece_index: int, my_conns: Dict[str, "socket.socket"]) -> bool:
+        """
+        Tải 1 mảnh từ Peer bất kỳ sử dụng connection riêng của worker (độc lập, không bị block).
+        my_conns: dict local của worker { peer_id: socket } — không dùng chung với worker khác.
+        """
         with self.lock:
             available_peers = [
                 (p_id, info) for p_id, info in self.connected_peers.items()
@@ -251,50 +262,48 @@ class TransferEngine:
         if not available_peers:
             return False
 
-        # Chọn ngẫu nhiên 1 peer trong danh sách (phân tải đều giữa nhiều Seeder)
         p_id, p_info = random.choice(available_peers)
-        sock = p_info["sock"]
-        sock_lock = p_info["sock_lock"]
+        ip   = p_info["ip"]
+        port = p_info["port"]
 
-        # Khóa socket của peer này — chỉ 1 worker được gửi/nhận tại 1 thời điểm
-        acquired = sock_lock.acquire(timeout=10.0)
-        if not acquired:
-            return False  # Peer đang bận, thử lại sau
+        # Lấy hoặc tạo connection riêng của worker này tới peer này
+        sock = my_conns.get(p_id)
+        if sock is None:
+            sock = self._connect_and_handshake(ip, port)
+            if not sock:
+                return False
+            recv_msg(sock)   # Tiêu thụ BITFIELD mà Seeder gửi ngay sau handshake
+            my_conns[p_id] = sock
 
         try:
             req_msg = create_request_msg(piece_index)
-            sock.settimeout(15.0)
-            
+            sock.settimeout(30.0)
+
             if not send_msg(sock, req_msg):
-                return False
+                raise ConnectionError("Gửi REQUEST thất bại")
 
             resp = recv_msg(sock)
             if resp and resp.get("type") == MessageType.PIECE.value:
                 if resp.get("piece_index") == piece_index:
-                    raw_b64 = resp.get("data")
-                    piece_data = base64.b64decode(raw_b64)
-
-                    # Ghi mảnh xuống đĩa và kiểm tra SHA-256
+                    piece_data = base64.b64decode(resp["data"])
                     if self.piece_manager.write_piece(piece_index, piece_data):
-                        print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ từ Peer {p_id} ({self.piece_manager.progress_percentage():.1f}%)")
-                        
-                        # Phát tin nhắn HAVE đến tất cả các peer kết nối nếu có peer_node
+                        print(f"[Worker-{self.peer_id}] Piece {piece_index} ✓ ← {p_id} "
+                              f"({self.piece_manager.progress_percentage():.1f}%)")
                         if self.peer_node:
                             self.peer_node.broadcast_have(piece_index)
                         return True
-        except Exception as e:
-            # Ngắt kết nối peer bị lỗi
+
+        except Exception:
+            # Connection bị đứt — xóa khỏi my_conns để worker sẽ tạo lại lần sau
+            try:
+                my_conns.pop(p_id).close()
+            except Exception:
+                pass
+            # Xóa peer khỏi connected_peers nếu tất cả worker đều gặp lỗi (doạn dưới)
             with self.lock:
                 if p_id in self.connected_peers:
-                    try:
-                        self.connected_peers[p_id]["sock"].close()
-                    except Exception:
-                        pass
                     del self.connected_peers[p_id]
-        finally:
-            # Chỉ release nếu đã acquire thành công
-            if acquired:
-                sock_lock.release()
+
         return False
 
     def _save_progress(self) -> None:
