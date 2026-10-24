@@ -21,7 +21,7 @@ class MessageType(str, Enum):
     KEEP_ALIVE = "KEEP_ALIVE"
     ERROR = "ERROR"
 
-def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
+def recv_exact(sock, num_bytes: int) -> bytes:
     """
     Hàm bổ trợ đọc chính xác N bytes từ TCP Socket.
     """
@@ -30,41 +30,36 @@ def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
         chunk = sock.recv(num_bytes - len(buf)) # Số byte còn thiếu vẫn cần nhận
         if not chunk:
             # Socket bị đóng hoặc hỏng kết nối khi chưa đọc đủ data
-            return None
+            raise EOFError
         buf.extend(chunk)
     return bytes(buf)
 
 def send_msg(sock, payload: Dict[str, Any]) -> bool:
-    try:
-        raw_json = json.dumps(payload).encode('utf-8') # dump : Chuyển Dict -> Json
-        length_prefix = struct.pack(">I", len(raw_json)) # Đóng gói thành 1 chuỗi nhị phân
-        sock.sendall(length_prefix + raw_json)
-        return True
-    except Exception as e:
-        print(f"[Protocol Error] Lỗi khi gửi message: {e}")
-        return False
+    raw_json = json.dumps(payload).encode('utf-8') # dump : Chuyển Dict -> Json
+    length_prefix = struct.pack(">I", len(raw_json)) # Đóng gói thành 1 chuỗi nhị phân
+    sock.sendall(length_prefix + raw_json)
+    return True
 
 
-
-def recv_msg(sock) -> Optional[Dict[str, Any]]:
+def recv_msg(sock) -> Dict[str, Any]:
     """
     Nhận 1 thông điệp JSON hoàn chỉnh từ socket bằng quy tắc Length-prefix framing.
     """
+    length_prefix = recv_exact(sock, 4)
+        
+    msg_len = struct.unpack(">I", length_prefix)[0]
+        
+    raw_json = recv_exact(sock, msg_len)
     try:
-        length_prefix = recv_exact(sock, 4)
-        if not length_prefix:
-            return None
+        result = json.loads(raw_json.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise Exception("JSON khong hop le") from e
+    
+    if not isinstance(result, dict):
+        raise Exception("Thong diep JSON sai kieu du lieu")
         
-        msg_len = struct.unpack(">I", length_prefix)[0]
-        
-        raw_json = recv_exact(sock, msg_len)
-        if not raw_json:
-            return None
-        
-        return json.loads(raw_json.decode('utf-8'))
-    except Exception as e:
-        print(f"[Protocol Error] Lỗi khi nhận message: {e}")
-        return None
+    return result
+    
 
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 

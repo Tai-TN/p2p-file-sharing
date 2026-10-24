@@ -165,8 +165,12 @@ class TransferEngine:
             if not sock:
                 continue
 
-            bitfield_msg = recv_msg(sock)
-            if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
+            try:
+                bitfield_msg = recv_msg(sock)
+                if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
+                    sock.close()
+                    continue
+            except Exception:
                 sock.close()
                 continue
 
@@ -261,41 +265,64 @@ class TransferEngine:
         if not acquired:
             return False  # Peer đang bận, thử lại sau
 
+        # Giai đoạn 1: Gửi yêu cầu
+        req_msg = create_request_msg(piece_index)
+        sock.settimeout(15.0)
+        try:           
+            send_msg(sock, req_msg)
+        except OSError:
+            self._disconnect_peer(p_id, sock)
+            return False
+        
+        # Giai đoạn 2: Nhận phản hồi
         try:
-            req_msg = create_request_msg(piece_index)
-            sock.settimeout(15.0)
-            
-            if not send_msg(sock, req_msg):
-                return False
-
             resp = recv_msg(sock)
-            if resp and resp.get("type") == MessageType.PIECE.value:
-                if resp.get("piece_index") == piece_index:
-                    raw_b64 = resp.get("data")
-                    piece_data = base64.b64decode(raw_b64)
+        except (EOFError, socket.timeout, OSError) as e:
+            self._disconnect_peer(p_id, sock)      
+            return False
+        except Exception:
+            self._disconnect_peer(p_id, sock)
+            return False
+        
+        # Giai đoạn 3: Kiểm tra phản hồi
+        if resp.get("type") == MessageType.PIECE.value:
+            self._disconnect_peer(p_id, sock)
+            return False
 
-                    # Ghi mảnh xuống đĩa và kiểm tra SHA-256
-                    if self.piece_manager.write_piece(piece_index, piece_data):
-                        print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ từ Peer {p_id} ({self.piece_manager.progress_percentage():.1f}%)")
-                        
-                        # Phát tin nhắn HAVE đến tất cả các peer kết nối nếu có peer_node
-                        if self.peer_node:
-                            self.peer_node.broadcast_have(piece_index)
-                        return True
-        except Exception as e:
-            # Ngắt kết nối peer bị lỗi
-            with self.lock:
-                if p_id in self.connected_peers:
-                    try:
-                        self.connected_peers[p_id]["sock"].close()
-                    except Exception:
-                        pass
-                    del self.connected_peers[p_id]
-        finally:
-            # Chỉ release nếu đã acquire thành công
-            if acquired:
-                sock_lock.release()
-        return False
+        if resp.get("piece_index") == piece_index:
+            self._disconnect_peer(p_id, sock)
+            return False
+        
+        # Giai đoạn 4: Kiểm tra dữ liệu Base64
+        raw_b64 = resp.get("data")
+        piece_data = base64.b64decode(raw_b64)
+
+        if not isinstance(raw_b64, str):
+            self._disconnect_peer(p_id, sock)
+            return False
+
+
+        # Giai đoạn 5: Ghi mảnh
+        try:
+            written = self.piece_manager.write_piece(piece_index, piece_data)
+        except OSError as e:
+            print(f"Lỗi ghi piece {piece_index}: {e}")
+            return False
+
+        if not written:
+            # Ví dụ: SHA-256 không khớp hoặc piece không được chấp nhận.
+            # Không tự động ngắt peer ở bước này.
+            return False
+
+        print(
+            f"[TransferEngine {self.peer_id}] "
+            f"Piece {piece_index} ✓ từ Peer {p_id} "
+            f"({self.piece_manager.progress_percentage():.1f}%)"
+        )
+        if self.peer_node:
+            self.peer_node.broadcast_have(piece_index)
+
+        return True
 
     def _save_progress(self) -> None:
         """Lưu tiến độ tải (.progress.json) hỗ trợ Resume download."""
@@ -369,3 +396,18 @@ class TransferEngine:
                 except Exception:
                     pass
             self.connected_peers.clear()
+
+    def _disconnect_peer(self, p_id, sock):
+        """Chỉ ngắt kết nối nếu peer vẫn đang dùng đúng socket này."""
+        with self.lock:
+            current = self.connected_peers.get(p_id)
+
+            if current is None or current.get("sock") is not sock:
+                return
+
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+            del self.connected_peers[p_id]
