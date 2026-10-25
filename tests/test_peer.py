@@ -57,6 +57,7 @@ class TestPeer(unittest.TestCase):
 
             # 3. Khởi chạy Seeder (Có file mẫu 100%)
             seeder_pm = PieceManager(self.sample_file_path, meta)
+            seeder_pm.verify_all_pieces()
             self.assertTrue(seeder_pm.is_complete())
 
             seeder_node = PeerNode("seeder_01", "127.0.0.1", seeder_port, seeder_pm)
@@ -64,6 +65,7 @@ class TestPeer(unittest.TestCase):
 
             seeder_engine = TransferEngine("seeder_01", "127.0.0.1", tracker_port, seeder_port, seeder_pm)
             seeder_engine._announce_to_tracker(event="started")
+            self.addCleanup(seeder_engine.stop)
 
             # 4. Khởi chạy Leecher (Tải file mới)
             download_file_path = os.path.join(self.test_dir, "downloaded.dat")
@@ -74,6 +76,7 @@ class TestPeer(unittest.TestCase):
             leecher_node.start_listening()
 
             leecher_engine = TransferEngine("leecher_01", "127.0.0.1", tracker_port, leecher_port, leecher_pm, max_workers=2)
+            self.addCleanup(leecher_engine.stop)
 
             # Khởi động tải P2P
             success = leecher_engine.start_download(peer_node=leecher_node)

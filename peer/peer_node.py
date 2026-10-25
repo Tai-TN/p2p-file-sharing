@@ -123,7 +123,7 @@ class PeerNode:
           2. Gửi HANDSHAKE_RESPONSE + BITFIELD
           3. Lặp nhận REQUEST → gửi PIECE (hoặc bỏ qua KEEP_ALIVE)
         """
-        conn.settimeout(60.0)  # Tự đóng nếu Peer ngắt kết nối hoặc im lặng quá 60 giây
+        conn.settimeout(180.0)  # Tự đóng nếu Peer ngắt kết nối hoặc im lặng quá 60 giây
 
         with self._sock_lock:
             self._active_sockets[addr] = conn

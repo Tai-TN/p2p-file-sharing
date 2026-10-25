@@ -23,6 +23,8 @@ class TransferEngine:
     Động cơ chuyển tải file P2P: Quản lý việc kết nối đến Tracker, kết nối trực tiếp đến các Peer khác,
     và điều phối các Worker Thread để tải song song các mảnh (Pieces) còn thiếu.
     """
+    HEARTBEAT_INTERVAL = 20.0
+
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
                  max_workers: int = 4, my_ip: str = ""):
@@ -37,6 +39,8 @@ class TransferEngine:
 
         self.is_running = False
         self.lock = threading.Lock()
+        self._announce_stop = threading.Event()
+        self._announce_thread: Optional[threading.Thread] = None
 
         # Quản lý danh sách các peer đã kết nối
         self.connected_peers: Dict[str, Dict] = {}
@@ -49,18 +53,12 @@ class TransferEngine:
 
     def start_download(self, peer_node=None) -> bool:
         """Bắt đầu quá trình tải tập tin song song."""
-        self.is_running = True
         self.peer_node = peer_node
         self._load_progress() # Dùng load_progress tránh việc verify lại toàn bộ hash -> Lâu lắc
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
-        # Gửi ANNOUNCE ban đầu lên Tracker
-        self._announce_to_tracker(event="started")
-
-        # Bắt đầu luồng heartbeat announce định kỳ
-        announce_thread = threading.Thread(target=self._periodic_announce, daemon=True)
-        announce_thread.start()
+        self.start_announcing()
 
 
         # Tạo và chạy luồng Worker Pool tải song song
@@ -99,6 +97,19 @@ class TransferEngine:
         
         return False
 
+    def start_announcing(self) -> None:
+        """Đăng ký file và duy trì heartbeat, kể cả khi đang seeding."""
+        if self.is_running:
+            return
+        if self._announce_stop.is_set():
+            return
+        self.is_running = True
+        self._announce_to_tracker(event="started")
+        self._announce_thread = threading.Thread(
+            target=self._periodic_announce, daemon=True
+        )
+        self._announce_thread.start()
+
     def _announce_to_tracker(self, event: str = "started") -> List[Dict]:
         """Gửi ANNOUNCE tới Tracker và lấy về danh sách các Peer khả dụng."""
         try:
@@ -122,6 +133,9 @@ class TransferEngine:
             resp = recv_msg(sock)
             sock.close()
 
+            if event == "stopped" or self.piece_manager.is_complete():
+                return []
+
             # Tiếp theo xin danh sách peers
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock2.settimeout(5.0)
@@ -139,10 +153,10 @@ class TransferEngine:
 
     def _periodic_announce(self) -> None:
         """Gửi ANNOUNCE cập nhật định kỳ 20 giây một lần."""
-        while self.is_running and not self.piece_manager.is_complete():
-            time.sleep(20)
-            peers = self._announce_to_tracker(event="started")
-            if peers:
+        while not self._announce_stop.wait(self.HEARTBEAT_INTERVAL):
+            event = "completed" if self.piece_manager.is_complete() else "started"
+            peers = self._announce_to_tracker(event=event)
+            if peers and not self.piece_manager.is_complete():
                 self._update_peer_connections(peers)
 
     def _update_peer_connections(self, peers_list: List[Dict]) -> None:
@@ -360,8 +374,10 @@ class TransferEngine:
 
 
     def stop(self) -> None:
-
         self.is_running = False
+        self._announce_stop.set()
+        if self._announce_thread and self._announce_thread is not threading.current_thread():
+            self._announce_thread.join()
         with self.lock:
             for p_info in self.connected_peers.values():
                 try:

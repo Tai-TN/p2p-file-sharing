@@ -5,13 +5,16 @@ Cách chạy:
     python run_client.py                        # localhost, cổng 6881
     python run_client.py 6882                   # cổng tùy chọn
     python run_client.py 6881 192.168.1.10      # qua mạng LAN
+    python run_client.py 6881 100.108.79.47 --advertise-ip 100.108.79.47
+                                                # qua Tailscale
 """
-import os, sys, random
+import argparse
+import ipaddress
+import os
+import random
 from peer.client import P2PClient
 
 # ── Cấu hình ──
-LISTEN_PORT  = int(sys.argv[1]) if len(sys.argv) > 1 else 6881
-TRACKER_HOST = sys.argv[2]     if len(sys.argv) > 2 else "127.0.0.1"
 TRACKER_PORT = 8000
 
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -19,9 +22,32 @@ SHARED_DIR   = os.path.join(BASE_DIR, "demo_workspace", "shared")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "demo_workspace", "downloads")
 
 
-def print_menu(peer_id: str) -> None:
+def ipv4_address(value: str) -> str:
+    """Chỉ chấp nhận IPv4 vì các socket của dự án đang dùng AF_INET."""
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError as exc:
+        raise argparse.ArgumentTypeError(f"IPv4 không hợp lệ: {value}") from exc
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="P2P client chia sẻ file")
+    parser.add_argument("listen_port", nargs="?", type=int, default=6881)
+    parser.add_argument("tracker_host", nargs="?", default="127.0.0.1")
+    parser.add_argument(
+        "--advertise-ip",
+        type=ipv4_address,
+        help="IPv4 báo cho tracker (ví dụ IP Tailscale); mặc định dùng IP LAN",
+    )
+    args = parser.parse_args(argv)
+    if not 1 <= args.listen_port <= 65535:
+        parser.error("listen_port phải nằm trong khoảng 1–65535")
+    return args
+
+
+def print_menu(peer_id: str, listen_port: int, tracker_host: str) -> None:
     print(f"\n{'='*50}")
-    print(f"  P2P CLIENT [{peer_id}] - Cổng {LISTEN_PORT} | Tracker {TRACKER_HOST}:{TRACKER_PORT}")
+    print(f"  P2P CLIENT [{peer_id}] - Cổng {listen_port} | Tracker {tracker_host}:{TRACKER_PORT}")
     print(f"{'='*50}")
     print("  1. Chia sẻ file")
     print("  2. Tải file")
@@ -31,13 +57,15 @@ def print_menu(peer_id: str) -> None:
 
 
 def main() -> None:
+    args = parse_args()
     peer_id = f"peer_{random.randint(1000, 9999)}"
 
     client = P2PClient(
         peer_id=peer_id,
-        listen_port=LISTEN_PORT,
-        tracker_host=TRACKER_HOST,
+        listen_port=args.listen_port,
+        tracker_host=args.tracker_host,
         tracker_port=TRACKER_PORT,
+        advertise_ip=args.advertise_ip,
     )
     client.start()
 
@@ -46,7 +74,7 @@ def main() -> None:
 
     try:
         while True:
-            print_menu(peer_id)
+            print_menu(peer_id, args.listen_port, args.tracker_host)
             choice = input("Lựa chọn: ").strip()
 
             if choice == "1":
