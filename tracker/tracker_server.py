@@ -1,7 +1,15 @@
+import sys
 import socket
 import threading
 import time
 from typing import Optional
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from protocol.messages import (
     MessageType,
     send_msg,
@@ -56,6 +64,7 @@ class TrackerServer:
     def _handle_client(self, conn: socket.socket, addr: tuple) -> None:
         """Xử lý yêu cầu từ một Peer kết nối đến."""
         try:
+            conn.settimeout(10.0)
             msg = recv_msg(conn)
             if not msg:
                 return

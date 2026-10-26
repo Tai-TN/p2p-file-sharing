@@ -1,9 +1,17 @@
 import unittest
 import os
+import sys
 import shutil
 import tempfile
 import time
 import socket
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from peer.selection import choose_next_piece
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
@@ -57,6 +65,9 @@ class TestPeer(unittest.TestCase):
 
             # 3. Khởi chạy Seeder (Có file mẫu 100%)
             seeder_pm = PieceManager(self.sample_file_path, meta)
+            # PieceManager khởi tạo bitfield rỗng; seeder phải xác minh file
+            # nguồn để đánh dấu các piece hợp lệ trước khi phục vụ upload.
+            seeder_pm.verify_all_pieces()
             self.assertTrue(seeder_pm.is_complete())
 
             seeder_node = PeerNode("seeder_01", "127.0.0.1", seeder_port, seeder_pm)

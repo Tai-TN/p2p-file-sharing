@@ -2,7 +2,15 @@
 run_tracker.py — Khởi động Tracker Server
 Chạy: python run_tracker.py
 """
+import sys
 import time
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from tracker.tracker_server import TrackerServer
 
 # ── Cấu hình ──

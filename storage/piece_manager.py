@@ -23,8 +23,31 @@ class PieceManager:
         # Bitfield: Danh sách boolean đánh dấu mảnh nào đã tải đúng, mảnh nào chưa
         self.bitfield: List[bool] = [False] * self.num_pieces
 
+        # Đánh dấu xem file có phải mới tạo (chưa có dữ liệu) hay không
+        self.is_new_file = not os.path.exists(self.target_file_path)
+
+        # File handle dùng chung (được bảo vệ bằng file_lock) tránh mở/đóng liên tục
+        self._file_handle: Optional[Any] = None
+
         # Chuẩn bị file đĩa và quét kiểm tra các piece đã sẵn có
         self._initialize_storage()
+
+    def _get_file_handle(self):
+        """Lấy hoặc mở lại file handle dùng chung."""
+        if self._file_handle is None or self._file_handle.closed:
+            self._file_handle = open(self.target_file_path, "r+b")
+        return self._file_handle
+
+    def close(self) -> None:
+        """Đóng file handle an toàn khi hoàn thành."""
+        with self.file_lock:
+            if self._file_handle is not None and not self._file_handle.closed:
+                try:
+                    self._file_handle.flush()
+                    self._file_handle.close()
+                except Exception:
+                    pass
+                self._file_handle = None
 
     def _initialize_storage(self) -> None:
         """
@@ -75,12 +98,12 @@ class PieceManager:
         
         with self.file_lock:
             try:
-                with open(self.target_file_path, "rb") as f:
-                    f.seek(offset)
-                    data = f.read(length)
-                    if len(data) == length:
-                        return data
-                    return None
+                f = self._get_file_handle()
+                f.seek(offset)
+                data = f.read(length)
+                if len(data) == length:
+                    return data
+                return None
             except Exception as e:
                 print(f"[Storage Error] Lỗi đọc piece {piece_index}: {e}")
                 return None
@@ -112,10 +135,9 @@ class PieceManager:
         # Ghi vào đĩa bằng seek() với Thread Lock
         with self.file_lock:
             try:
-                with open(self.target_file_path, "r+b") as f:
-                    f.seek(offset)
-                    f.write(data)
-                    f.flush()
+                f = self._get_file_handle()
+                f.seek(offset)
+                f.write(data)
 
                 # Cập nhật trạng thái bitfield
                 self.bitfield[piece_index] = True
@@ -146,4 +168,6 @@ class PieceManager:
 
     def progress_percentage(self) -> float:
         """Tính % tiến độ tải hiện tại."""
+        if self.num_pieces == 0:
+            return 100.0 if self.file_size == 0 else 0.0
         return (self.completed_pieces_count() / self.num_pieces) * 100.0

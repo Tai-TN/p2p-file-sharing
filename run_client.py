@@ -7,6 +7,13 @@ Cách chạy:
     python run_client.py 6881 192.168.1.10      # qua mạng LAN
 """
 import os, sys, random
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from peer.client import P2PClient
 
 # ── Cấu hình ──

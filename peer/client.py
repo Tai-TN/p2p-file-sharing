@@ -37,17 +37,33 @@ class P2PClient:
     """
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
-                 tracker_host: str = "127.0.0.1", tracker_port: int = 8000):
+                 tracker_host: str = "127.0.0.1", tracker_port: int = 8000,
+                 regular_slots: int = 2, optimistic_slots: int = 1,
+                 choking_interval: float = 20.0,
+                 measurement_window: float = 30.0):
         self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
         self.listen_port = listen_port
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
+        # Các tham số này được truyền xuống PeerNode để cấu hình Tit-for-Tat.
+        self.regular_slots = regular_slots  # Số upload slot dành cho Peer đóng góp tốt.
+        self.optimistic_slots = optimistic_slots  # Số slot thử nghiệm ngẫu nhiên.
+        self.choking_interval = choking_interval  # Chu kỳ đổi danh sách unchoke (giây).
+        self.measurement_window = measurement_window  # Cửa sổ đo tốc độ đóng góp (giây).
 
         # IP thực của máy — báo cho Tracker để peer khác biết kết nối vào đâu
         self.my_ip = get_local_ip()
 
         # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi máy trong LAN
-        self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port)
+        self.node = PeerNode(
+            peer_id=self.peer_id,
+            host="0.0.0.0",
+            port=listen_port,
+            regular_slots=regular_slots,
+            optimistic_slots=optimistic_slots,
+            choking_interval=choking_interval,
+            measurement_window=measurement_window,
+        )
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
@@ -122,7 +138,7 @@ class P2PClient:
         # Đăng ký vào PeerNode → các Peer khác có thể xin mảnh
         self.node.add_file(info_hash, pm)
 
-        # Tạo engine chỉ để Announce lên Tracker (không tải gì)
+        # Tạo engine để Announce lên Tracker và duy trì Seeding
         engine = TransferEngine(
             peer_id=self.peer_id,
             tracker_host=self.tracker_host,
@@ -131,7 +147,7 @@ class P2PClient:
             piece_manager=pm,
             my_ip=self.my_ip,
         )
-        engine._announce_to_tracker(event="started")
+        engine.start_seeding()
 
         with self._lock:
             self._tasks[info_hash] = {

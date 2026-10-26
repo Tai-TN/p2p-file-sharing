@@ -21,6 +21,13 @@ class MessageType(str, Enum):
     KEEP_ALIVE = "KEEP_ALIVE"
     ERROR = "ERROR"
 
+    # Trạng thái choking: điều khiển Peer nào được phép gửi REQUEST.
+    CHOKE = "CHOKE"
+    UNCHOKE = "UNCHOKE"
+    INTERESTED = "INTERESTED"
+    NOT_INTERESTED = "NOT_INTERESTED"
+
+
 def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
     """
     Hàm bổ trợ đọc chính xác N bytes từ TCP Socket.
@@ -54,13 +61,12 @@ def recv_msg(sock) -> Optional[Dict[str, Any]]:
         length_prefix = recv_exact(sock, 4)
         if not length_prefix:
             return None
-        
+
         msg_len = struct.unpack(">I", length_prefix)[0]
-        
         raw_json = recv_exact(sock, msg_len)
         if not raw_json:
             return None
-        
+
         return json.loads(raw_json.decode('utf-8'))
     except Exception as e:
         print(f"[Protocol Error] Lỗi khi nhận message: {e}")
@@ -132,3 +138,22 @@ def create_keepalive_msg() -> Dict[str, Any]:
     return {
         "type": MessageType.KEEP_ALIVE.value
     }
+
+
+# Các message điều khiển Tit-for-Tat không chứa payload ngoài trường "type".
+
+def create_choke_msg() -> Dict[str, Any]:
+    """Báo cho Peer nhận rằng tạm thời không được gửi REQUEST."""
+    return {"type": MessageType.CHOKE.value}
+
+def create_unchoke_msg() -> Dict[str, Any]:
+    """Báo cho Peer nhận rằng được phép gửi REQUEST."""
+    return {"type": MessageType.UNCHOKE.value}
+
+def create_interested_msg() -> Dict[str, Any]:
+    """Báo rằng ta đang cần piece từ Peer đối diện."""
+    return {"type": MessageType.INTERESTED.value}
+
+def create_not_interested_msg() -> Dict[str, Any]:
+    """Báo rằng hiện tại ta không cần piece từ Peer đối diện."""
+    return {"type": MessageType.NOT_INTERESTED.value}

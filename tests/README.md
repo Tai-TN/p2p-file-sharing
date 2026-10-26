@@ -8,10 +8,12 @@ Tài liệu này giải thích chi tiết cấu trúc, mục đích và cách ho
 
 ```text
 tests/
-├── README.md               # Tài liệu hướng dẫn chi tiết về test (File này)
-├── __init__.py             # Đánh dấu tests/ là một Python package
-├── test_piece_manager.py   # Test module quản lý lưu trữ, chia mảnh & kiểm tra tính toàn vẹn (Checksum)
-└── test_protocol.py        # Test module đóng gói, mã hóa Base64 & truyền nhận thông điệp qua Socket
+├── README.md                   # Tài liệu hướng dẫn chi tiết về test (File này)
+├── __init__.py                 # Đánh dấu tests/ là một Python package
+├── test_peer.py                # Test thuật toán Rarest-First & Test End-to-End P2P File Transfer
+├── test_connection.py          # Test lớp PeerConnection (Handshake, Bitfield, Choking, HAVE message)
+├── test_choking.py             # Test thuật toán Choking Tit-for-Tat & Optimistic unchoking
+└── test_protocol_messages.py   # Test đóng gói & định dạng các loại MessageType
 ```
 
 ---
@@ -22,39 +24,43 @@ Bạn có thể chạy các bài test từ thư mục gốc của dự án (`p2p
 
 ### Cách 1: Chạy toàn bộ các test trong thư mục (Khuyên dùng)
 ```bash
-python3 -m unittest discover tests
+python -m unittest discover tests
 ```
 
 ### Cách 2: Chạy riêng từng file test
 ```bash
-python3 tests/test_piece_manager.py
-python3 tests/test_protocol.py
+python -m unittest tests/test_peer.py
+python -m unittest tests/test_connection.py
+python -m unittest tests/test_choking.py
+python -m unittest tests/test_protocol_messages.py
 ```
 
 ---
 
 ## 🔍 3. Chi tiết từng File Test
 
-### 📂 File 1: `test_piece_manager.py`
-Module này kiểm tra toàn bộ logic lưu trữ file dưới đĩa cứng, chia mảnh (piece), tính toán hash SHA-256, ghi file không theo thứ tự và khả năng khôi phục tiến độ (Resume download).
+### 📂 File 1: `test_peer.py`
+Module này kiểm tra toàn bộ luồng truyền tải thực tế (Integration / End-to-End) và thuật toán chọn mảnh:
+- `test_rarest_first_selection`: Kiểm tra thuật toán Rarest-First ưu tiên chọn mảnh có độ hiếm cao nhất trong swarm.
+- `test_end_to_end_p2p_file_transfer`: Khởi chạy 1 Tracker Server, 1 Seeder Node và 1 Leecher Node; Leecher kết nối tải toàn bộ các piece đa luồng, ghi đĩa, verify SHA-256 và so khớp 100% dữ liệu gốc.
 
-| Tên Test Case | Mục đích & Chi tiết kiểm tra |
-| :--- | :--- |
-| `test_metadata_creation` | **Tạo và chuyển đổi Metadata:**<br>• Kiểm tra hàm `PieceMetadata.create_from_file()` chia file 350 bytes thành 4 pieces (100, 100, 100, 50 bytes).<br>• Kiểm tra tính chính xác của `info_hash` và mảng danh sách các chuỗi hash SHA-256.<br>• Kiểm tra tính năng Seri/Deseri (`to_dict()` và `from_dict()`). |
-| `test_out_of_order_write_and_read` | **Ghi mảnh không theo thứ tự (Out-of-order execution):**<br>• Giả lập P2P tải các piece từ nhiều peer khác nhau theo thứ tự ngẫu nhiên: `Piece 2` ➔ `Piece 0` ➔ `Piece 3` ➔ `Piece 1`.<br>• Kiểm tra tính toán % tiến độ (`get_progress()`) và danh sách mảnh còn thiếu (`get_missing_pieces()`).<br>• Đọc lại toàn bộ file sau khi hoàn thành 100% và so sánh chính xác từng byte dữ liệu với file gốc. |
-| `test_corrupted_piece_rejection` | **Kiểm tra từ chối dữ liệu bị hỏng (Checksum Integrity):**<br>• Gửi dữ liệu giả bị biến dạng (`b"X" * 100`) vào piece 0.<br>• Kiểm tra hàm `write_piece()` phát hiện sai checksum SHA-256, in cảnh báo `[Storage Error]` và trả về `False`.<br>• Xác nhận `bitfield[0]` vẫn là `False` (không ghi nhận piece hỏng). |
-| `test_existing_file_resume` | **Khôi phục tiến độ tải dở (Resume download):**<br>• Giả lập ghi dở mảnh 0 và mảnh 1 rồi tắt ứng dụng.<br>• Tạo mới `PieceManager` trỏ vào file dở đó và kiểm tra hàm `_verify_existing_file()` có tự động quét đĩa, xác minh hash và khôi phục mảng `bitfield` đúng trạng thái trước đó hay không. |
+### 📂 File 2: `test_connection.py`
+Kiểm tra quản lý kết nối TCP giữa 2 peer:
+- Handshake & tiếp nhận bitfield ban đầu.
+- Nhận diện và cập nhật trạng thái CHOKE / UNCHOKE.
+- Kiểm tra chỉ gửi INTERESTED đúng một lần.
+- Kiểm tra tự động bỏ qua control messages khi đang đợi PIECE.
+- Kiểm tra cập nhật bitfield và gọi callback khi nhận bản tin `HAVE`.
 
----
+### 📂 File 3: `test_choking.py`
+Kiểm tra giải thuật Choking (Tit-for-Tat):
+- Regular slots ưu tiên các peer có đóng góp tốt.
+- Optimistic unchoke chọn ngẫu nhiên các peer đang interested để thử nghiệm.
+- Peer không còn interested bị thu hồi upload slot ngay lập tức.
+- Ngăn chặn free-rider chiếm regular slot.
 
-### 📂 File 2: `test_protocol.py`
-Module này kiểm tra giao thức truyền thông mạng P2P, đóng gói JSON framing qua giao thức Length-Prefix (4 bytes độ dài) và mã hóa dữ liệu nhị phân (Binary chunks).
-
-| Tên Test Case | Mục đích & Chi tiết kiểm tra |
-| :--- | :--- |
-| `test_send_and_recv_msg` | **Truyền nhận thông điệp qua Socket (Length-prefix Framing):**<br>• Sử dụng `socket.socketpair()` tạo cặp socket ảo giao tiếp trực tiếp trong RAM.<br>• Kiểm tra `send_msg()` gắn 4-byte độ dài ở đầu gói tin JSON và `recv_msg()` bóc tách chính xác loại thông điệp `ANNOUNCE`. |
-| `test_binary_piece_encoding` | **Mã hóa nhị phân dữ liệu mảnh (Base64 Encoding):**<br>• Kiểm tra hàm `create_piece_msg()` chuyển đổi mảng bytes nhị phân bất kỳ (kể cả chứa ký tự đặc biệt `\x00\xff\xfe`) thành chuỗi mã hóa Base64 an toàn cho JSON.<br>• Kiểm tra phía nhận `base64.b64decode()` và khôi phục lại nguyên vẹn dữ liệu nhị phân ban đầu. |
-| `test_bitfield_creation` | **Tạo thông điệp trạng thái mảnh (`BITFIELD` message):**<br>• Kiểm tra hàm `create_bitfield_msg()` đóng gói mảng boolean đại diện cho trạng thái sở hữu các piece thành định dạng JSON chuẩn. |
+### 📂 File 4: `test_protocol_messages.py`
+Kiểm tra việc tạo và định dạng chuẩn xác của các thông điệp điều khiển (`CHOKE`, `UNCHOKE`, `INTERESTED`, `NOT_INTERESTED`).
 
 ---
 
