@@ -2,7 +2,7 @@ import json
 import struct
 import base64
 from enum import Enum
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 class MessageType(str, Enum):
     # Tracker Messages
@@ -64,7 +64,8 @@ def recv_msg(sock) -> Dict[str, Any]:
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 
 def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
-                        event: str = "started", downloaded: int = 0, left: int = 0) -> Dict[str, Any]:
+                        event: str = "started", downloaded: int = 0, left: int = 0,
+                        bad_peers: List[str] = None) -> Dict[str, Any]:
     return {
         "type": MessageType.ANNOUNCE.value,
         "info_hash": info_hash,
@@ -73,7 +74,8 @@ def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
         "port": port,
         "event": event,
         "downloaded": downloaded,
-        "left": left
+        "left": left,
+        "bad_peers": bad_peers or []  # Danh sách peer_id bị xác nhận là chết
     }
 
 def create_get_peers_msg(info_hash: str, peer_id: str) -> Dict[str, Any]:

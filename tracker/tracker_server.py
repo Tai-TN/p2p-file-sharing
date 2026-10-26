@@ -87,6 +87,15 @@ class TrackerServer:
                     event=event
                 )
 
+                # Xử lý báo cáo peer chết từ Leecher
+                bad_peers = msg.get("bad_peers", [])
+                if bad_peers and isinstance(bad_peers, list):
+                    self.state.report_bad_peers(
+                        info_hash=info_hash,
+                        reporter_id=peer_id,
+                        bad_peer_ids=bad_peers
+                    )
+
                 # Trả về phản hồi thành công
                 response = {
                     "type": MessageType.ANNOUNCE_RESPONSE.value,

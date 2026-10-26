@@ -169,7 +169,7 @@ class PeerNode:
                 elif req_type == MessageType.KEEP_ALIVE.value:
                     pass  # Không làm gì, chỉ để giữ kết nối sống
 
-        except socket.timeout:
+        except (EOFError,OSError,socket.timeout):
             pass  # Timeout bình thường
         except Exception:
             pass
