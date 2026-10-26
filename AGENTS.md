@@ -18,7 +18,7 @@ File này áp dụng cho toàn bộ repository. Đây là quy ước làm việc
 5. Giữ kiểm tra SHA-256 trước khi đánh dấu một mảnh là đã có. Khi khôi phục tiến độ, trạng thái lưu trong JSON không thay thế việc xác minh dữ liệu trên đĩa.
 6. Với code đa luồng, bảo vệ trạng thái dùng chung bằng lock phù hợp. Không giữ lock chung trong lúc gọi mạng hoặc thao tác có thể chờ lâu. Đảm bảo socket và luồng được dừng gọn khi client thoát.
 7. Lỗi mạng phải có timeout, cách thử lại hữu hạn hoặc khoảng nghỉ hợp lý, và thông tin đủ để chẩn đoán. Tránh nuốt lỗi âm thầm ở luồng tải chính.
-8. Không thêm dependency chỉ để giải quyết việc thư viện chuẩn Python đã làm được. Nếu cần dependency mới, nêu rõ lý do và cách cài đặt.
+8. Không thêm dependency chỉ để giải quyết việc thư viện chuẩn Python đã làm được với code logic đơn giản , không phức tạp.Nếu việc dùng dependency khiến code dễ hiểu và đỡ phức tạp hơn thì cần nêu rõ lý do và cách cài đặt.
 
 ## Kiểm tra trước khi bàn giao
 

@@ -33,7 +33,14 @@ def ipv4_address(value: str) -> str:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="P2P client chia sẻ file")
     parser.add_argument("listen_port", nargs="?", type=int, default=6881)
-    parser.add_argument("tracker_host", nargs="?", default="127.0.0.1")
+    parser.add_argument("tracker_host", nargs="?", default="127.0.0.1",
+                        help="Địa chỉ Tracker (có thể là IP hoặc host:port, VD: 0.tcp.ap.ngrok.io:12345)")
+    parser.add_argument(
+        "--tracker-port",
+        type=int,
+        default=None,
+        help="Cổng của Tracker (mặc định: 8000 hoặc lấy từ tracker_host)",
+    )
     parser.add_argument(
         "--advertise-ip",
         type=ipv4_address,
@@ -42,12 +49,26 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not 1 <= args.listen_port <= 65535:
         parser.error("listen_port phải nằm trong khoảng 1–65535")
+
+    # Hỗ trợ truyền tracker dạng host:port (tiện khi dùng ngrok TCP)
+    tracker_port = TRACKER_PORT
+    if ":" in args.tracker_host and not args.tracker_host.startswith("["):
+        parts = args.tracker_host.split(":")
+        args.tracker_host = parts[0]
+        try:
+            tracker_port = int(parts[1])
+        except ValueError:
+            parser.error(f"Cổng tracker không hợp lệ trong '{parts[0]}:{parts[1]}'")
+    if args.tracker_port is not None:
+        tracker_port = args.tracker_port
+
+    args.tracker_port = tracker_port
     return args
 
 
-def print_menu(peer_id: str, listen_port: int, tracker_host: str) -> None:
+def print_menu(peer_id: str, listen_port: int, tracker_host: str, tracker_port: int = TRACKER_PORT) -> None:
     print(f"\n{'='*50}")
-    print(f"  P2P CLIENT [{peer_id}] - Cổng {listen_port} | Tracker {tracker_host}:{TRACKER_PORT}")
+    print(f"  P2P CLIENT [{peer_id}] - Cổng {listen_port} | Tracker {tracker_host}:{tracker_port}")
     print(f"{'='*50}")
     print("  1. Chia sẻ file")
     print("  2. Tải file")
@@ -64,7 +85,7 @@ def main() -> None:
         peer_id=peer_id,
         listen_port=args.listen_port,
         tracker_host=args.tracker_host,
-        tracker_port=TRACKER_PORT,
+        tracker_port=args.tracker_port,
         advertise_ip=args.advertise_ip,
     )
     client.start()
@@ -74,7 +95,7 @@ def main() -> None:
 
     try:
         while True:
-            print_menu(peer_id, args.listen_port, args.tracker_host)
+            print_menu(peer_id, args.listen_port, args.tracker_host, args.tracker_port)
             choice = input("Lựa chọn: ").strip()
 
             if choice == "1":

@@ -11,6 +11,13 @@ class MessageType(str, Enum):
     GET_PEERS = "GET_PEERS"
     GET_PEERS_RESPONSE = "GET_PEERS_RESPONSE"
 
+    # NAT Traversal — Signaling (persistent channel giữa peer và Tracker)
+    SIGNAL_REGISTER = "SIGNAL_REGISTER"  # Peer đăng ký kênh signaling với Tracker
+    SIGNAL_READY    = "SIGNAL_READY"     # Tracker xác nhận kênh đã sẵn sàng
+    PUNCH_REQUEST   = "PUNCH_REQUEST"    # Peer A yêu cầu Tracker báo cho Peer B punch
+    PUNCH_SIGNAL    = "PUNCH_SIGNAL"     # Tracker gửi thông tin endpoint để peer bắt đầu punch
+    PUNCH_FAILED    = "PUNCH_FAILED"     # Target peer không online hoặc không hỗ trợ hole punch
+
     # Peer-to-Peer Messages
     HANDSHAKE = "HANDSHAKE"
     HANDSHAKE_RESPONSE = "HANDSHAKE_RESPONSE"
@@ -69,16 +76,29 @@ def recv_msg(sock) -> Optional[Dict[str, Any]]:
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 
 def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
-                        event: str = "started", downloaded: int = 0, left: int = 0) -> Dict[str, Any]:
+                        event: str = "started", downloaded: int = 0, left: int = 0,
+                        udp_port: int = 0, public_ip: str = "") -> Dict[str, Any]:
+    """
+    Tạo thông điệp ANNOUNCE gửi lên Tracker.
+
+    Các trường mới cho NAT traversal:
+      - udp_port:  UDP port đã được NAT map ra ngoài (lấy từ STUN). Peer khác
+                   dùng trường này để thực hiện UDP hole punch.
+      - public_ip: Public IP lấy từ STUN. Tracker ưu tiên dùng IP này thay vì
+                   IP lấy từ TCP socket khi báo lại cho các peer khác.
+                   Để trống nếu chưa chạy STUN.
+    """
     return {
         "type": MessageType.ANNOUNCE.value,
         "info_hash": info_hash,
         "peer_id": peer_id,
-        "ip": ip,           # IP thực của máy — để Tracker báo đúng cho peer khác kết nối vào
-        "port": port,
+        "ip": ip,           # IP LAN tự báo — Tracker dùng làm fallback
+        "port": port,       # TCP port lắng nghe (upload mảnh)
         "event": event,
         "downloaded": downloaded,
-        "left": left
+        "left": left,
+        "udp_port": udp_port,   # UDP port đã STUN-mapped (0 = chưa có STUN)
+        "public_ip": public_ip,  # Public IP từ STUN (rỗng = chưa có STUN)
     }
 
 def create_get_peers_msg(info_hash: str, peer_id: str) -> Dict[str, Any]:
@@ -131,4 +151,58 @@ def create_piece_msg(piece_index: int, data_bytes: bytes) -> Dict[str, Any]:
 def create_keepalive_msg() -> Dict[str, Any]:
     return {
         "type": MessageType.KEEP_ALIVE.value
+    }
+
+
+# ── NAT Traversal / Signaling message builders ────────────────────────────────
+
+def create_signal_register_msg(peer_id: str, ip: str, udp_port: int,
+                                tcp_port: int) -> Dict[str, Any]:
+    """
+    Peer gửi lên Tracker để mở kênh signaling persistent.
+    - ip, udp_port: public endpoint từ STUN (dùng cho hole punch)
+    - tcp_port: TCP port lắng nghe (dùng sau khi hole punch thành công)
+    """
+    return {
+        "type":     MessageType.SIGNAL_REGISTER.value,
+        "peer_id":  peer_id,
+        "ip":       ip,
+        "udp_port": udp_port,
+        "tcp_port": tcp_port,
+    }
+
+
+def create_punch_request_msg(target_peer_id: str) -> Dict[str, Any]:
+    """
+    Peer A gửi qua signal channel để yêu cầu Tracker báo Peer B cùng punch.
+    Endpoint của A đã được lưu lúc SIGNAL_REGISTER → không cần gửi lại.
+    """
+    return {
+        "type":           MessageType.PUNCH_REQUEST.value,
+        "target_peer_id": target_peer_id,
+    }
+
+
+def create_punch_signal_msg(peer_id: str, ip: str, udp_port: int,
+                             tcp_port: int) -> Dict[str, Any]:
+    """
+    Tracker gửi cho peer để thông báo: có peer khác muốn kết nối tới bạn.
+    - peer_id: ID của bên kia (để leecher biết punch với ai)
+    - ip, udp_port: public UDP endpoint của bên kia để gửi UDP probe
+    - tcp_port: TCP port của bên kia (fallback kết nối sau hole punch)
+    """
+    return {
+        "type":     MessageType.PUNCH_SIGNAL.value,
+        "peer_id":  peer_id,
+        "ip":       ip,
+        "udp_port": udp_port,
+        "tcp_port": tcp_port,
+    }
+
+
+def create_punch_failed_msg(reason: str) -> Dict[str, Any]:
+    """Tracker thông báo hole punch thất bại (peer target không hỗ trợ hoặc offline)."""
+    return {
+        "type":   MessageType.PUNCH_FAILED.value,
+        "reason": reason,
     }

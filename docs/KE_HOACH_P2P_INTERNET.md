@@ -8,10 +8,12 @@ Mục tiêu của lần thử này là chạy tracker và seeder trên Linux, ch
 | --- | --- |
 | Linux `taitn` trong Tailscale | Đã thấy IP `100.108.79.47` khi lập kế hoạch; kiểm tra lại bằng `tailscale ip -4` trước khi chạy. |
 | Android `v2352ga` trong Tailscale | Đã thấy IP `100.82.132.18`; `tailscale ping` nhận phản hồi qua `DERP(sin)`. |
-| Code và kiểm thử trên Linux | Đã thêm `--advertise-ip` và heartbeat cho seeder; `python3 -m unittest discover tests -v` đạt 4/4 bài test qua socket localhost. |
+| Code và kiểm thử trên Linux | Đã thêm `--advertise-ip`, heartbeat và báo lỗi khi đăng ký tracker thất bại; `python3 -m unittest discover tests -v` đạt 5/5 bài test qua socket localhost. |
 | Gói source và file mẫu | Đã tạo `demo_workspace/p2p-file-sharing-src.tar.gz` (gồm source và metadata), `demo_workspace/internet-demo.bin`; file mẫu không nằm trong gói để Android phải tải nó qua P2P. |
-| Termux và Python trên Android | Chưa được xác nhận trên thiết bị Android. |
+| Termux và Python trên Android | Theo phản hồi của người dùng, Android đã gửi được log tới tracker; chưa kiểm tra trực tiếp trên thiết bị. |
 | Truyền file Linux → Android và đối chiếu SHA-256 | Chưa được xác nhận trên hai thiết bị. |
+
+Kiểm tra trên Fedora ngày 25/10/2026: client đang lắng nghe TCP 6881 với lệnh `python3 run_client.py 6881 100.108.79.47 --advertise-ip 100.108.79.47`; Tailscale vẫn thấy hai thiết bị. Tuy nhiên tại thời điểm kiểm tra, không có tiến trình lắng nghe TCP 8000 trên Fedora. Cần chạy tracker trước khi seeder đăng ký. Kết quả này là ảnh chụp tại thời điểm kiểm tra, không khẳng định tracker chưa từng chạy khi Android gửi log.
 
 Tailscale có thể dùng relay khi NAT chặn đường kết nối trực tiếp: <https://tailscale.com/docs/reference/device-connectivity>.
 
@@ -67,6 +69,8 @@ python3 run_client.py 6881 100.108.79.47 --advertise-ip 100.108.79.47
 ```
 
 Trong menu, chọn `1` và nhập đường dẫn tuyệt đối của file mẫu `demo_workspace/internet-demo.bin` (1,5 MiB, gồm 3 mảnh). Có thể lấy đường dẫn bằng `realpath demo_workspace/internet-demo.bin` từ terminal Linux. Metadata đã được chuẩn bị tại `demo_workspace/shared/internet-demo.bin.meta.json`; client sẽ kiểm tra file nguồn và bắt đầu chia sẻ. Giữ tracker và seeder đang chạy. Đợi hơn 120 giây trước khi bắt đầu tải để kiểm tra heartbeat có giữ seeder trên tracker hay không.
+
+Sau khi chọn `1`, terminal seeder phải in `Đã đăng ký với tracker 100.108.79.47:8000`, còn terminal tracker phải in `Cập nhật Peer ...`. Chỉ khởi động client chưa đăng ký file; phải chọn `1` và nhập đúng file nguồn. Nếu đã mở client trước khi sửa code, thoát bằng menu `4`, chạy lại lệnh trên để dùng bản mới. Có thể kiểm tra tracker đang nghe bằng `ss -ltnp | rg ':8000'` trên Fedora. Nếu cổng 8000 trống hoặc client báo `Connection refused`, chạy lại `python3 run_tracker.py` và chọn `1` lại. Nếu tracker đang nghe nhưng vẫn không có log, kiểm tra dòng `Tracker` in lúc client khởi động và lỗi ANNOUNCE trong terminal seeder.
 
 ### 4. Chạy leecher trên Android
 

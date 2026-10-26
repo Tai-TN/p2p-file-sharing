@@ -8,16 +8,17 @@ from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
 from storage.piece_manager import PieceManager
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
+from nat.stun_client import STUNClient, NATInfo, NATType
+from nat.signaling import TrackerSignalChannel
+from nat.hole_punch import HolePunchManager
 
 
 def get_local_ip() -> str:
     """Lấy IP thực của máy trong mạng LAN."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
 
@@ -27,6 +28,8 @@ class P2PClient:
     Kiến trúc bên trong:
     - 1 PeerNode duy nhất lắng nghe trên listen_port (đóng vai Server upload).
     - Nhiều TransferEngine chạy ngầm, mỗi engine phụ trách 1 file đang download.
+    - 1 STUNClient chạy lúc start() để lấy public endpoint và NAT type;
+      kết quả được chia sẻ cho mọi TransferEngine qua self.nat_info.
     """
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
@@ -37,11 +40,20 @@ class P2PClient:
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
 
-        # Địa chỉ mà peer khác dùng để kết nối tới máy này.
+        # Địa chỉ LAN mà peer khác dùng để kết nối tới máy này (fallback khi STUN thất bại).
         self.my_ip = advertise_ip if advertise_ip is not None else get_local_ip()
 
-        # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi máy trong LAN
+        # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi interface
         self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port)
+
+        # Kết quả STUN — None trước khi start() được gọi
+        self.nat_info: Optional[NATInfo] = None
+
+        # Signal channel persistent với Tracker — None cho đến khi start() thành công
+        self._signal_channel: Optional[TrackerSignalChannel] = None
+
+        # Trình quản lý đục lỗ NAT
+        self._hole_punch_mgr = HolePunchManager(my_peer_id=self.peer_id, local_port=listen_port)
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
@@ -49,11 +61,46 @@ class P2PClient:
 
 
     def start(self) -> None:
-        """Mở cổng TCP và sẵn sàng nhận kết nối từ Peer khác."""
+        """Mở cổng TCP, chạy STUN để lấy public endpoint, rồi bắt đầu lắng nghe."""
         self.node.start_listening()
+
+        # Chạy STUN nhanh (quick mode) để lấy public IP:UDP_port
+        # Không block lâu: dùng get_public_endpoint() thay vì get_nat_info() đầy đủ
+        print(f"[P2PClient {self.peer_id}] Đang kiểm tra NAT qua STUN...")
+        try:
+            stun = STUNClient(local_port=self.listen_port, timeout=3.0)
+            self.nat_info = stun.get_public_endpoint()
+        except Exception as e:
+            print(f"[P2PClient {self.peer_id}] STUN thất bại ({e}) — tiếp tục với IP LAN")
+            self.nat_info = None
+
         print(f"[P2PClient {self.peer_id}] Đã khởi động")
-        print(f"  IP máy này : {self.my_ip}:{self.listen_port}")
+        print(f"  IP LAN     : {self.my_ip}:{self.listen_port}")
+        if self.nat_info:
+            print(f"  Public IP  : {self.nat_info.public_ip}:{self.nat_info.public_port} (UDP/STUN)")
+            print(f"  NAT type   : {self.nat_info.nat_type}")
+        else:
+            print(f"  Public IP  : (không lấy được — STUN thất bại)")
         print(f"  Tracker    : {self.tracker_host}:{self.tracker_port}")
+
+        # Mở signal channel với Tracker (chỉ khi có STUN info)
+        if self.nat_info:
+            self._signal_channel = TrackerSignalChannel(
+                tracker_host=self.tracker_host,
+                tracker_port=self.tracker_port,
+                peer_id=self.peer_id,
+                ip=self.nat_info.public_ip,
+                udp_port=self.nat_info.public_port,
+                tcp_port=self.listen_port,
+            )
+            self._signal_channel.on_punch_signal = self._on_punch_signal
+            self._signal_channel.on_punch_failed  = self._on_punch_failed
+            if self._signal_channel.start():
+                print(f"[P2PClient {self.peer_id}] Signal channel: sẵn sàng")
+            else:
+                print(f"[P2PClient {self.peer_id}] Signal channel: không kết nối được "
+                      f"(Tracker chưa hỗ trợ hoặc chưa online)")
+                self._signal_channel = None
 
     def stop(self) -> None:
         """Dừng tất cả engine, hủy đăng ký với Tracker, đóng kết nối."""
@@ -71,8 +118,55 @@ class P2PClient:
             except Exception:
                 pass
 
+        # Đóng signal channel trước khi dừng node
+        if self._signal_channel:
+            try:
+                self._signal_channel.stop()
+            except Exception:
+                pass
+            self._signal_channel = None
+
         self.node.stop()
         print("[P2PClient] Đã dừng hoàn toàn.")
+
+    # ── NAT traversal callbacks ───────────────────────────────────────────── #
+
+    def _on_punch_signal(self, msg: dict) -> None:
+        """
+        Callback khi Tracker gửi PUNCH_SIGNAL — có peer muốn hole punch tới mình.
+        Kích hoạt UDP hole punching và kết nối hai chiều trong background thread.
+        """
+        peer_id  = msg.get("peer_id", "?")
+        ip       = msg.get("ip", "?")
+        udp_port = msg.get("udp_port", 0)
+        tcp_port = msg.get("tcp_port", 0)
+        print(f"[P2PClient {self.peer_id}] PUNCH_SIGNAL: peer={peer_id} "
+              f"UDP={ip}:{udp_port} TCP={tcp_port} → Bắt đầu đục lỗ...")
+
+        def _punch_worker():
+            # 1. Đục lỗ UDP
+            res = self._hole_punch_mgr.handle_punch_signal(msg)
+            if res.get("udp_success"):
+                print(f"[P2PClient {self.peer_id}] Đục lỗ UDP tới {peer_id} thành công!")
+
+            # 2. Thử kết nối TCP từ các engine đang tải
+            with self._lock:
+                engines = [t["engine"] for t in self._tasks.values() if "engine" in t]
+            for eng in engines:
+                if not eng.piece_manager.is_complete():
+                    eng._update_peer_connections([{
+                        "peer_id": peer_id,
+                        "ip": ip,
+                        "port": tcp_port,
+                        "udp_port": udp_port,
+                    }])
+
+        t = threading.Thread(target=_punch_worker, daemon=True, name=f"punch-{peer_id}")
+        t.start()
+
+    def _on_punch_failed(self, reason: str) -> None:
+        """Callback khi Tracker báo hole punch thất bại."""
+        print(f"[P2PClient {self.peer_id}] PUNCH_FAILED: {reason}")
 
     # ── Chia sẻ file (Seeder)
 
@@ -124,8 +218,14 @@ class P2PClient:
             listen_port=self.listen_port,
             piece_manager=pm,
             my_ip=self.my_ip,
+            nat_info=self.nat_info,   # public endpoint từ STUN
+            signal_channel=self._signal_channel,
         )
-        engine.start_announcing()
+        try:
+            engine.start_announcing()
+        except Exception:
+            self.node.remove_file(info_hash)
+            raise
 
         with self._lock:
             self._tasks[info_hash] = {
@@ -173,6 +273,8 @@ class P2PClient:
             piece_manager=pm,
             max_workers=4,
             my_ip=self.my_ip,
+            nat_info=self.nat_info,   # public endpoint từ STUN
+            signal_channel=self._signal_channel,
         )
 
         with self._lock:
@@ -205,6 +307,7 @@ class P2PClient:
                         "Seeding (Hoàn tất)" if success else "Thất bại / Đã dừng"
                     )
         except Exception as e:
+            print(f"[P2PClient {self.peer_id}] Lỗi tải file: {e}")
             with self._lock:
                 if info_hash in self._tasks:
                     self._tasks[info_hash]["status"] = f"Lỗi: {e}"

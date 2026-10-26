@@ -5,7 +5,7 @@ import socket
 import base64
 import random
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from storage.piece_manager import PieceManager
 from protocol.messages import (
     MessageType,
@@ -17,6 +17,7 @@ from protocol.messages import (
     create_request_msg
 )
 from .selection import choose_next_piece
+from nat.stun_client import STUNClient, NATInfo, NATType
 
 class TransferEngine:
     """
@@ -27,20 +28,28 @@ class TransferEngine:
 
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
-                 max_workers: int = 4, my_ip: str = ""):
+                 max_workers: int = 4, my_ip: str = "",
+                 nat_info: Optional[NATInfo] = None,
+                 signal_channel: Optional[Any] = None):
         self.peer_id = peer_id
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
         self.listen_port = listen_port
         self.piece_manager = piece_manager
         self.max_workers = max_workers
-        self.my_ip = my_ip          # IP thực của máy — báo cho Tracker để peer khác kết nối đúng chỗ
+        self.my_ip = my_ip          # IP LAN của máy — báo cho Tracker để peer khác kết nối đúng chỗ
         self.info_hash = piece_manager.metainfo["info_hash"]
+
+        # Thông tin NAT từ STUN (None = chưa chạy STUN hoặc STUN thất bại)
+        self.nat_info: Optional[NATInfo] = nat_info
+        # Kênh signaling với Tracker để yêu cầu đục lỗ NAT khi kết nối trực tiếp thất bại
+        self.signal_channel = signal_channel
 
         self.is_running = False
         self.lock = threading.Lock()
         self._announce_stop = threading.Event()
         self._announce_thread: Optional[threading.Thread] = None
+        self._last_tracker_error: Optional[str] = None
 
         # Quản lý danh sách các peer đã kết nối
         self.connected_peers: Dict[str, Dict] = {}
@@ -103,52 +112,70 @@ class TransferEngine:
             return
         if self._announce_stop.is_set():
             return
+        self._announce_to_tracker(event="started", raise_on_error=True)
         self.is_running = True
-        self._announce_to_tracker(event="started")
+        print(f"[TransferEngine {self.peer_id}] Đã đăng ký với tracker {self.tracker_host}:{self.tracker_port}")
         self._announce_thread = threading.Thread(
             target=self._periodic_announce, daemon=True
         )
         self._announce_thread.start()
 
-    def _announce_to_tracker(self, event: str = "started") -> List[Dict]:
+    def _tracker_request(self, message: Dict, response_type: MessageType) -> Dict:
+        with socket.create_connection((self.tracker_host, self.tracker_port), timeout=5.0) as sock:
+            if not send_msg(sock, message):
+                raise ConnectionError("Không gửi được yêu cầu")
+            response = recv_msg(sock)
+        if not isinstance(response, dict) or response.get("type") != response_type.value:
+            raise ConnectionError(f"Phản hồi tracker không hợp lệ: {response!r}")
+        return response
+
+    def _announce_to_tracker(self, event: str = "started", raise_on_error: bool = False) -> List[Dict]:
         """Gửi ANNOUNCE tới Tracker và lấy về danh sách các Peer khả dụng."""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((self.tracker_host, self.tracker_port))
-
             downloaded_bytes = int((self.piece_manager.progress_percentage() / 100.0) * self.piece_manager.file_size)
             left_bytes = self.piece_manager.file_size - downloaded_bytes
+
+            # Đính kèm UDP endpoint từ STUN nếu có
+            udp_port  = self.nat_info.public_port if self.nat_info else 0
+            public_ip = self.nat_info.public_ip   if self.nat_info else ""
 
             msg = create_announce_msg(
                 info_hash=self.info_hash,
                 peer_id=self.peer_id,
                 port=self.listen_port,
-                ip=self.my_ip,          # IP thực để Tracker lưu đúng địa chỉ
+                ip=self.my_ip,          # IP LAN — Tracker dùng làm fallback
                 event=event,
                 downloaded=downloaded_bytes,
-                left=left_bytes
+                left=left_bytes,
+                udp_port=udp_port,
+                public_ip=public_ip,
             )
-            send_msg(sock, msg)
-            resp = recv_msg(sock)
-            sock.close()
+            resp = self._tracker_request(msg, MessageType.ANNOUNCE_RESPONSE)
+            if resp.get("status") != "OK":
+                raise ConnectionError(f"Tracker từ chối ANNOUNCE: {resp!r}")
+
+            with self.lock:
+                self._last_tracker_error = None
 
             if event == "stopped" or self.piece_manager.is_complete():
                 return []
 
             # Tiếp theo xin danh sách peers
-            sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock2.settimeout(5.0)
-            sock2.connect((self.tracker_host, self.tracker_port))
             get_p_msg = create_get_peers_msg(self.info_hash, self.peer_id)
-            send_msg(sock2, get_p_msg)
-            p_resp = recv_msg(sock2)
-            sock2.close()
+            p_resp = self._tracker_request(get_p_msg, MessageType.GET_PEERS_RESPONSE)
 
             if p_resp and p_resp.get("peers"):
                 return p_resp["peers"]
             return []
-        except Exception as e:
+        except Exception as exc:
+            error = f"Tracker {self.tracker_host}:{self.tracker_port}: {exc}"
+            if raise_on_error:
+                raise ConnectionError(error) from exc
+            with self.lock:
+                should_log = error != self._last_tracker_error
+                self._last_tracker_error = error
+            if should_log:
+                print(f"[TransferEngine {self.peer_id}] Lỗi ANNOUNCE: {error}")
             return []
 
     def _periodic_announce(self) -> None:
@@ -176,6 +203,20 @@ class TransferEngine:
 
             # Làm network NGOÀI lock — worker khác vẫn tải bình thường trong lúc này
             sock = self._connect_and_handshake(ip, port)
+
+            # Nếu kết nối trực tiếp thất bại và ta có signal channel, thử đục lỗ NAT qua Tracker
+            if not sock and self.signal_channel and getattr(self.signal_channel, "is_connected", False):
+                udp_port = p_info.get("udp_port", 0)
+                if udp_port:
+                    print(f"[TransferEngine {self.peer_id}] Kết nối trực tiếp tới {p_id} ({ip}:{port}) thất bại. Gửi PUNCH_REQUEST...")
+                    try:
+                        if self.signal_channel.request_punch(p_id):
+                            # Đợi 0.8s để tín hiệu PUNCH_SIGNAL và gói tin UDP probe mở lỗ NAT
+                            time.sleep(0.8)
+                            sock = self._connect_and_handshake(ip, port)
+                    except Exception as e:
+                        print(f"[TransferEngine {self.peer_id}] Lỗi khi yêu cầu đục lỗ NAT tới {p_id}: {e}")
+
             if not sock:
                 continue
 

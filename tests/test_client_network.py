@@ -7,10 +7,34 @@ from unittest.mock import patch
 from peer.client import P2PClient
 from peer.transfer_engine import TransferEngine
 from run_client import parse_args
+from storage.metainfo import load_metainfo
 from tracker.tracker_server import TrackerServer
 
 
 class TestClientNetwork(unittest.TestCase):
+    def test_seeder_reports_tracker_connection_failure(self):
+        with tempfile.TemporaryDirectory() as test_dir:
+            source = os.path.join(test_dir, "sample.dat")
+            meta_path = os.path.join(test_dir, "sample.dat.meta.json")
+            with open(source, "wb") as file:
+                file.write(b"test data")
+
+            client = P2PClient(peer_id="seeder-failure", listen_port=0)
+            client.start()
+            try:
+                with patch(
+                    "peer.transfer_engine.socket.create_connection",
+                    side_effect=ConnectionRefusedError("Connection refused"),
+                ):
+                    with self.assertRaisesRegex(ConnectionError, "Tracker 127.0.0.1:8000.*Connection refused"):
+                        client.share_file(source, meta_path)
+
+                info_hash = load_metainfo(meta_path)["info_hash"]
+                self.assertNotIn(info_hash, client.node._piece_managers)
+                self.assertEqual(client.get_status_list(), [])
+            finally:
+                client.stop()
+
     def test_cli_keeps_old_arguments_and_accepts_advertised_ipv4(self):
         old_args = parse_args(["6882", "192.168.1.10"])
         self.assertEqual(old_args.listen_port, 6882)
@@ -39,7 +63,9 @@ class TestClientNetwork(unittest.TestCase):
                 advertise_ip="127.0.0.23",
             )
             try:
-                client.start()
+                # Test đường advertise-ip khi STUN không cung cấp public endpoint.
+                with patch("peer.client.STUNClient.get_public_endpoint", return_value=None):
+                    client.start()
                 client.listen_port = client.node.server_socket.getsockname()[1]
                 with patch.object(TransferEngine, "HEARTBEAT_INTERVAL", 0.03):
                     info_hash = client.share_file(source, meta_path)
