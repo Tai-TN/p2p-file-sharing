@@ -287,8 +287,9 @@ class STUNClient:
         self.stun_servers = stun_servers or DEFAULT_STUN_SERVERS
         self.local_port = local_port
         self.timeout = timeout
+        self.last_server: Optional[Tuple[str, int]] = None
 
-    def get_public_endpoint(self) -> Optional[NATInfo]:
+    def get_public_endpoint(self, sock: Optional[socket.socket] = None) -> Optional[NATInfo]:
         """
         Lấy public IP và UDP port. Không cần detect NAT type đầy đủ.
         Nhanh hơn get_nat_info() — dùng khi chỉ cần endpoint để báo cho Tracker.
@@ -296,8 +297,12 @@ class STUNClient:
         Returns:
             NATInfo với nat_type=UNKNOWN nếu không test thêm, hoặc None nếu STUN thất bại.
         """
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.bind(("0.0.0.0", self.local_port))
+        owns_socket = sock is None
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if owns_socket:
+                sock.bind(("0.0.0.0", self.local_port))
             local_port = sock.getsockname()[1]   # lấy port OS đã cấp
             local_ip = self._get_local_ip()       # IP thực trong LAN
 
@@ -306,6 +311,7 @@ class STUNClient:
                     result = _stun_request(sock, host, port, timeout=self.timeout)
                     if result:
                         pub_ip, pub_port = result
+                        self.last_server = (host, port)
                         logger.info(f"Public endpoint: {pub_ip}:{pub_port} (local: {local_ip}:{local_port})")
                         return NATInfo(
                             public_ip=pub_ip,
@@ -317,8 +323,11 @@ class STUNClient:
                 except Exception as e:
                     logger.debug(f"STUN server {host}:{port} thất bại: {e}")
 
-        logger.warning("Tất cả STUN server đều thất bại")
-        return None
+            logger.warning("Tất cả STUN server đều thất bại")
+            return None
+        finally:
+            if owns_socket:
+                sock.close()
 
     def get_nat_info(self) -> NATInfo:
         """

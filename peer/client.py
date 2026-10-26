@@ -70,12 +70,21 @@ class P2PClient:
         # Chạy STUN nhanh (quick mode) để lấy public IP:UDP_port
         # Không block lâu: dùng get_public_endpoint() thay vì get_nat_info() đầy đủ
         print(f"[P2PClient {self.peer_id}] Đang kiểm tra NAT qua STUN...")
+        udp_sock = None
         try:
             stun = STUNClient(local_port=self.listen_port, timeout=3.0)
-            self.nat_info = stun.get_public_endpoint()
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.bind(("0.0.0.0", self.listen_port))
+            self.nat_info = stun.get_public_endpoint(udp_sock)
+            if self.nat_info:
+                self._hole_punch_mgr.set_socket(udp_sock, stun.last_server)
+                udp_sock = None  # manager sở hữu socket đến khi client dừng
         except Exception as e:
             print(f"[P2PClient {self.peer_id}] STUN thất bại ({e}) — tiếp tục với IP LAN")
             self.nat_info = None
+        finally:
+            if udp_sock is not None:
+                udp_sock.close()
 
         print(f"[P2PClient {self.peer_id}] Đã khởi động")
         print(f"  IP LAN     : {self.my_ip}:{self.listen_port}")
@@ -129,6 +138,7 @@ class P2PClient:
                 pass
             self._signal_channel = None
 
+        self._hole_punch_mgr.close()
         self.node.stop()
         print("[P2PClient] Đã dừng hoàn toàn.")
 

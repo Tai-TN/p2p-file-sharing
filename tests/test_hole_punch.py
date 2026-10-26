@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 from nat.hole_punch import UDPHolePuncher, HolePunchManager, PROBE_PREFIX, ACK_PREFIX
 from peer.client import P2PClient
 from peer.transfer_engine import TransferEngine
+from nat.stun_client import STUNClient, NATInfo, NATType
 
 
 def _free_udp_port() -> int:
@@ -111,6 +112,58 @@ class TestHolePunch(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(sock)
         self.assertGreaterEqual(elapsed, 0.25)
+
+    def test_stun_and_punch_reuse_same_udp_socket(self):
+        """Endpoint công bố qua STUN phải thuộc socket vẫn mở khi đục lỗ."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock_a, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock_b:
+            sock_a.bind(("127.0.0.1", 0))
+            sock_b.bind(("127.0.0.1", 0))
+            port_a = sock_a.getsockname()[1]
+            port_b = sock_b.getsockname()[1]
+            stun_a = STUNClient(stun_servers=[("127.0.0.1", 3478)])
+            with patch("nat.stun_client._stun_request", return_value=("127.0.0.1", port_a)):
+                endpoint = stun_a.get_public_endpoint(sock_a)
+            self.assertEqual(endpoint.public_port, port_a)
+            self.assertGreaterEqual(sock_a.fileno(), 0)
+
+            mgr_a = HolePunchManager("peer_A", port_a)
+            mgr_b = HolePunchManager("peer_B", port_b)
+            mgr_a.set_socket(sock_a)
+            mgr_b.set_socket(sock_b)
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    future_a = pool.submit(mgr_a.handle_punch_signal,
+                        {"peer_id": "peer_B", "ip": "127.0.0.1", "udp_port": port_b})
+                    future_b = pool.submit(mgr_b.handle_punch_signal,
+                        {"peer_id": "peer_A", "ip": "127.0.0.1", "udp_port": port_a})
+                    self.assertTrue(future_a.result(timeout=4)["udp_success"])
+                    self.assertTrue(future_b.result(timeout=4)["udp_success"])
+                self.assertEqual(sock_a.getsockname()[1], endpoint.public_port)
+            finally:
+                mgr_a.close()
+                mgr_b.close()
+
+    def test_client_keeps_stun_socket_until_stop(self):
+        client = P2PClient(peer_id="socket-owner", listen_port=0)
+
+        def fake_stun(stun, udp_sock):
+            port = udp_sock.getsockname()[1]
+            return NATInfo("127.0.0.1", port, "127.0.0.1", port, NATType.OPEN)
+
+        with patch.object(client.node, "start_listening"), \
+             patch.object(client.node, "stop"), \
+             patch.object(STUNClient, "get_public_endpoint", autospec=True,
+                          side_effect=fake_stun), \
+             patch("peer.client.TrackerSignalChannel") as channel_class:
+            channel_class.return_value.start.return_value = True
+            client.start()
+            udp_sock = client._hole_punch_mgr._shared_socket
+            self.assertIsNotNone(udp_sock)
+            self.assertEqual(udp_sock.getsockname()[1], client.nat_info.public_port)
+            self.assertGreaterEqual(udp_sock.fileno(), 0)
+            client.stop()
+            self.assertEqual(udp_sock.fileno(), -1)
 
     def test_hole_punch_manager_coordination(self):
         """HolePunchManager gọi callback và xử lý signal đúng."""
