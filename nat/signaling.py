@@ -58,7 +58,8 @@ class TrackerSignalChannel:
                  ip: str,
                  udp_port: int,
                  tcp_port: int,
-                 connect_timeout: float = 5.0):
+                 connect_timeout: float = 5.0,
+                 candidates: Optional[list] = None):
         """
         Args:
             tracker_host/port: Địa chỉ Tracker.
@@ -74,6 +75,7 @@ class TrackerSignalChannel:
         self.ip       = ip
         self.udp_port = udp_port
         self.tcp_port = tcp_port
+        self.candidates = candidates or []
         self.connect_timeout = connect_timeout
 
         self._sock: Optional[socket.socket] = None
@@ -184,6 +186,7 @@ class TrackerSignalChannel:
                 ip=self.ip,
                 udp_port=self.udp_port,
                 tcp_port=self.tcp_port,
+                candidates=self.candidates,
             )
             if not send_msg(sock, reg_msg):
                 sock.close()

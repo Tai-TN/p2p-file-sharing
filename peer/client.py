@@ -12,6 +12,7 @@ from peer.transfer_engine import TransferEngine
 from nat.stun_client import STUNClient, NATInfo, NATType
 from nat.signaling import TrackerSignalChannel
 from nat.hole_punch import HolePunchManager
+from nat.udp_transfer import UDPTransfer
 
 
 def get_local_ip() -> str:
@@ -35,7 +36,10 @@ class P2PClient:
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
                  tracker_host: str = "127.0.0.1", tracker_port: int = 8000,
-                 advertise_ip: Optional[str] = None):
+                 advertise_ip: Optional[str] = None, transport: str = "tcp"):
+        if transport not in ("tcp", "udp"):
+            raise ValueError("transport phải là tcp hoặc udp")
+        self.transport = transport
         self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
         self.listen_port = listen_port
         self.tracker_host = tracker_host
@@ -55,6 +59,10 @@ class P2PClient:
 
         # Trình quản lý đục lỗ NAT
         self._hole_punch_mgr = HolePunchManager(my_peer_id=self.peer_id, local_port=listen_port)
+        self._udp_transfer = (UDPTransfer(self._hole_punch_mgr,
+                                          self.node.get_piece_manager)
+                              if transport == "udp" else None)
+        self.udp_candidates: List[Dict] = []
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
@@ -77,6 +85,14 @@ class P2PClient:
             udp_sock.bind(("0.0.0.0", self.listen_port))
             self.nat_info = stun.get_public_endpoint(udp_sock)
             if self.nat_info:
+                if self.transport == "udp":
+                    self.udp_candidates = stun.gather_candidates(udp_sock, self.nat_info)
+                    print(f"[P2PClient {self.peer_id}] Ứng viên UDP: {self.udp_candidates}")
+                    mappings = {(c["ip"], c["port"]) for c in self.udp_candidates
+                                if c["type"] == "srflx"}
+                    if len(mappings) > 1:
+                        print(f"[P2PClient {self.peer_id}] Cảnh báo: NAT ánh xạ UDP "
+                              "khác nhau theo máy STUN; đường trực tiếp có thể thất bại")
                 self._hole_punch_mgr.set_socket(udp_sock, stun.last_server)
                 udp_sock = None  # manager sở hữu socket đến khi client dừng
         except Exception as e:
@@ -85,6 +101,9 @@ class P2PClient:
         finally:
             if udp_sock is not None:
                 udp_sock.close()
+
+        if self.transport == "udp" and self.nat_info is None:
+            raise RuntimeError("Chế độ UDP cần STUN hoạt động để lấy địa chỉ ứng viên")
 
         print(f"[P2PClient {self.peer_id}] Đã khởi động")
         print(f"  IP LAN     : {self.my_ip}:{self.listen_port}")
@@ -104,6 +123,7 @@ class P2PClient:
                 ip=self.nat_info.public_ip,
                 udp_port=self.nat_info.public_port,
                 tcp_port=self.listen_port,
+                candidates=self.udp_candidates,
             )
             self._signal_channel.on_punch_signal = self._on_punch_signal
             self._signal_channel.on_punch_failed  = self._on_punch_failed
@@ -138,6 +158,8 @@ class P2PClient:
                 pass
             self._signal_channel = None
 
+        if self._udp_transfer:
+            self._udp_transfer.close()
         self._hole_punch_mgr.close()
         self.node.stop()
         print("[P2PClient] Đã dừng hoàn toàn.")
@@ -167,10 +189,12 @@ class P2PClient:
                 # 1. Đục lỗ UDP
                 res = self._hole_punch_mgr.handle_punch_signal(msg)
                 if res.get("udp_success"):
-                    print(f"[P2PClient {self.peer_id}] Đục lỗ UDP tới {peer_id} thành công; "
-                          "truyền file hiện vẫn dùng TCP.")
+                    print(f"[P2PClient {self.peer_id}] Đường UDP trực tiếp tới {peer_id} "
+                          f"đã xác nhận: {self._hole_punch_mgr.get_endpoint(peer_id)}")
 
                 # 2. Thử kết nối TCP từ các engine đang tải
+                if self.transport == "udp":
+                    return
                 with self._lock:
                     engines = [t["engine"] for t in self._tasks.values() if "engine" in t]
                 for eng in engines:
@@ -244,6 +268,8 @@ class P2PClient:
             my_ip=self.my_ip,
             nat_info=self.nat_info,   # public endpoint từ STUN
             signal_channel=self._signal_channel,
+            transport=self.transport,
+            udp_transfer=self._udp_transfer,
         )
         try:
             engine.start_announcing()
@@ -299,6 +325,8 @@ class P2PClient:
             my_ip=self.my_ip,
             nat_info=self.nat_info,   # public endpoint từ STUN
             signal_channel=self._signal_channel,
+            transport=self.transport,
+            udp_transfer=self._udp_transfer,
         )
 
         with self._lock:

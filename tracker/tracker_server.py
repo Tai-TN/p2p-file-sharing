@@ -1,6 +1,7 @@
 import socket
 import threading
 import time
+import ipaddress
 from typing import Optional
 from protocol.messages import (
     MessageType, send_msg, recv_msg,
@@ -162,6 +163,7 @@ class TrackerServer:
         ip       = register_msg.get("ip", addr[0])
         udp_port = int(register_msg.get("udp_port", 0) or 0)
         tcp_port = int(register_msg.get("tcp_port", 0) or 0)
+        candidates = self._valid_candidates(register_msg.get("candidates", []))
 
         if not peer_id:
             return
@@ -171,7 +173,8 @@ class TrackerServer:
         conn.settimeout(self.signal_idle_timeout)
 
         # Đăng ký channel
-        self.state.register_signal_channel(peer_id, conn, ip, udp_port, tcp_port)
+        self.state.register_signal_channel(peer_id, conn, ip, udp_port, tcp_port,
+                                           candidates)
 
         # Xác nhận với peer
         send_msg(conn, {"type": MessageType.SIGNAL_READY.value, "peer_id": peer_id})
@@ -246,6 +249,7 @@ class TrackerServer:
                 ip=requester_info["ip"],
                 udp_port=requester_info["udp_port"],
                 tcp_port=requester_info["tcp_port"],
+                candidates=requester_info["candidates"],
             )
         )
 
@@ -257,10 +261,32 @@ class TrackerServer:
                 ip=target_info["ip"],
                 udp_port=target_info["udp_port"],
                 tcp_port=target_info["tcp_port"],
+                candidates=target_info["candidates"],
             )
         )
 
         print(f"[Tracker Server] PUNCH_SIGNAL relay: {requesting_peer_id} ↔ {target_peer_id}")
+
+    @staticmethod
+    def _valid_candidates(value) -> list:
+        """Giới hạn địa chỉ ứng viên mà tracker nhận từ peer không tin cậy."""
+        if not isinstance(value, list) or len(value) > 8:
+            return []
+        result = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            ip, port = item.get("ip"), item.get("port")
+            try:
+                address = ipaddress.IPv4Address(ip)
+                if address.is_unspecified or not isinstance(port, int) or not 1 <= port <= 65535:
+                    continue
+            except (ipaddress.AddressValueError, TypeError):
+                continue
+            if len(result) < 8:
+                result.append({"ip": str(address), "port": port,
+                               "type": "host" if item.get("type") == "host" else "srflx"})
+        return result
 
     def _periodic_cleanup(self) -> None:
         """Vòng lặp dọn dẹp các Peer không phản hồi định kỳ."""

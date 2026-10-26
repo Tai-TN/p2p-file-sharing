@@ -95,3 +95,37 @@ Nếu không tải được, kiểm tra theo thứ tự: Tailscale Connected ở
 - Relay Tailscale giúp thử chức năng trên mạng không mở được cổng, nhưng tốc độ có thể thấp hơn đường trực tiếp.
 - Tracker và giao thức P2P của dự án chưa có xác thực riêng. Chỉ chạy demo trong mạng Tailscale của các thiết bị tin cậy.
 - Nếu muốn người dùng không cần cài Tailscale, cần thiết kế và triển khai relay hoặc cơ chế xuyên NAT trong ứng dụng ở giai đoạn sau.
+
+## Thử chế độ UDP trực tiếp (26/10/2026)
+
+Source hiện có chế độ `--transport udp` viết bằng thư viện chuẩn Python, không dùng WebRTC.
+Hai peer dùng cùng socket UDP cho STUN, thử nhiều địa chỉ ứng viên (host và địa chỉ
+quan sát được từ các máy STUN), xác nhận probe/ACK rồi truyền mảnh qua UDP với
+ACK, gửi lại gói mất và kiểm tra SHA-256. `--transport tcp` vẫn là mặc định.
+Tracker chỉ chuyển thông tin endpoint và tín hiệu; ngrok TCP chỉ cần cho tracker.
+
+Chạy cùng bản source mới ở cả Fedora và Android. Tắt Tailscale trên cả hai máy,
+giữ Android trên dữ liệu di động:
+
+```sh
+# Máy chạy tracker, nếu tracker đặt trên Fedora:
+python3 run_tracker.py
+
+# Fedora seeder (thay HOST:PORT bằng địa chỉ ngrok TCP hiện tại của tracker):
+python3 run_client.py 6881 HOST:PORT --transport udp
+
+# Android Termux leecher:
+python run_client.py 6882 HOST:PORT --transport udp
+```
+
+Seeder chọn `1` và chia sẻ file nhỏ nhiều mảnh; chuyển **chỉ file `.meta.json`** sang
+Android, chọn `2` để tải. Khi thành công, hai máy phải hiện `Đường UDP trực tiếp ...
+đã xác nhận`, leecher hiện `Piece ... ✓ UDP` và SHA-256 file nhận trùng file gốc.
+Nếu sau 100 giây hiện `Không tạo được đường UDP trực tiếp`, đó là thất bại của
+đường trực tiếp trên cặp mạng thử này. Những địa chỉ do STUN trả về chỉ là ứng viên,
+không bảo đảm đi vào được qua NAT hoặc firewall. Chế độ này chưa có relay, mã hóa,
+xác thực peer và chưa hỗ trợ nhiều seeder đồng thời trong một lượt tải.
+
+Kiểm thử localhost đã truyền đủ file nhiều mảnh và so sánh SHA-256. Chưa kiểm thử
+được Fedora ↔ Android trên hai mạng thực tế; không coi kiểm thử localhost là bằng
+chứng xuyên NAT thành công.

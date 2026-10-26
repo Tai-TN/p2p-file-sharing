@@ -31,7 +31,8 @@ class TransferEngine:
                  listen_port: int, piece_manager: PieceManager,
                  max_workers: int = 4, my_ip: str = "",
                  nat_info: Optional[NATInfo] = None,
-                 signal_channel: Optional[Any] = None):
+                 signal_channel: Optional[Any] = None,
+                 transport: str = "tcp", udp_transfer: Optional[Any] = None):
         self.peer_id = peer_id
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
@@ -45,6 +46,8 @@ class TransferEngine:
         self.nat_info: Optional[NATInfo] = nat_info
         # Kênh signaling với Tracker để yêu cầu đục lỗ NAT khi kết nối trực tiếp thất bại
         self.signal_channel = signal_channel
+        self.transport = transport
+        self.udp_transfer = udp_transfer
 
         self.is_running = False
         self.lock = threading.Lock()
@@ -74,8 +77,10 @@ class TransferEngine:
 
         # Tạo và chạy luồng Worker Pool tải song song
         worker_threads = []
-        for i in range(self.max_workers):
-            t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
+        for i in range(1 if self.transport == "udp" else self.max_workers):
+            target = self._udp_worker_loop if self.transport == "udp" else self._worker_loop
+            args = () if self.transport == "udp" else (i,)
+            t = threading.Thread(target=target, args=args, daemon=True)
             t.start()
             worker_threads.append(t)
 
@@ -190,6 +195,8 @@ class TransferEngine:
 
     def _update_peer_connections(self, peers_list: List[Dict]) -> None:
         """Kết nối tới các Peer mới trong danh sách thu thập từ Tracker."""
+        if self.transport == "udp":
+            return  # UDP worker tự yêu cầu punch và chỉ dùng endpoint đã xác nhận
         for p_info in peers_list:
             p_id = p_info.get("peer_id")
             ip   = p_info.get("ip")
@@ -245,6 +252,58 @@ class TransferEngine:
                     print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
                 else:
                     sock.close()  # Worker khác vừa kết nối peer này → đóng socket thừa
+
+    def _udp_worker_loop(self) -> None:
+        """Một seeder mỗi lượt tải; không dùng TCP để lấy mảnh."""
+        if not self.udp_transfer or not self.signal_channel:
+            print(f"[TransferEngine {self.peer_id}] UDP cần STUN và signal channel với tracker")
+            self.is_running = False
+            return
+        deadline = time.monotonic() + 100.0
+        attempts = {}
+        seeder_id = None
+        while self.is_running and not self.piece_manager.is_complete() and seeder_id is None:
+            peers = self._announce_to_tracker()
+            for peer in peers:
+                peer_id = peer.get("peer_id")
+                if not peer_id or peer_id == self.peer_id or peer.get("left") != 0:
+                    continue
+                if self.udp_transfer.manager.get_endpoint(peer_id):
+                    seeder_id = peer_id
+                    break
+                now = time.monotonic()
+                if (peer.get("udp_port") and attempts.get(peer_id, 0) < 3
+                        and now >= self._next_punch_attempt.get(peer_id, 0.0)):
+                    self._next_punch_attempt[peer_id] = now + self.PUNCH_RETRY_INTERVAL
+                    attempts[peer_id] = attempts.get(peer_id, 0) + 1
+                    print(f"[TransferEngine {self.peer_id}] Kiểm tra ứng viên UDP "
+                          f"{peer_id}, lượt {attempts[peer_id]}/3")
+                    self.signal_channel.request_punch(peer_id)
+            if seeder_id is None:
+                if time.monotonic() >= deadline:
+                    print(f"[TransferEngine {self.peer_id}] Không tạo được đường UDP trực tiếp "
+                          "sau 100 giây; cặp mạng này cần mở cổng hoặc relay")
+                    self.is_running = False
+                    return
+                time.sleep(2.0)
+
+        print(f"[TransferEngine {self.peer_id}] Tải UDP trực tiếp từ {seeder_id}")
+        for piece_index in self.piece_manager.missing_pieces():
+            if not self.is_running:
+                return
+            _, length = self.piece_manager._get_piece_bounds(piece_index)
+            for attempt in range(3):
+                data = self.udp_transfer.request_piece(
+                    seeder_id, self.info_hash, piece_index, length)
+                if data is not None and self.piece_manager.write_piece(piece_index, data):
+                    print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ UDP "
+                          f"({self.piece_manager.progress_percentage():.1f}%)")
+                    break
+                print(f"[TransferEngine {self.peer_id}] Mảnh {piece_index} "
+                      f"không nhận đủ/hợp lệ; thử lại {attempt + 1}/3")
+            else:
+                self.is_running = False
+                return
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
         """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
@@ -382,41 +441,9 @@ class TransferEngine:
         Khôi phục trạng thái tải, ưu tiên tốc độ: => có 3 trường hợp, có file progress, không có file progress
         => Verify all piecce, mới khởi taoj => Mảng mặc định là False
         """
-        target = self.piece_manager.target_file_path
-
-        # Trường hợp 1: Có file .progress.json
-        if os.path.exists(self.progress_file):
-            try:
-                with open(self.progress_file, "r") as f:
-                    data = json.load(f)
-
-                if data.get("info_hash") != self.info_hash:
-                    raise ValueError("info_hash không khớp")
-
-                saved_bitfield = data.get("bitfield", [])
-                if len(saved_bitfield) != self.piece_manager.num_pieces:
-                    raise ValueError("Số mảnh không khớp")
-
-                # Khôi phục bitfield từ JSON — không cần đọc lại đĩa
-                self.piece_manager.bitfield = saved_bitfield
-                count = sum(1 for b in saved_bitfield if b)
-                print(f"[TransferEngine] Resume từ JSON: {count}/{self.piece_manager.num_pieces} mảnh "
-                      f"({self.piece_manager.progress_percentage():.1f}%)")
-                return
-
-            except Exception:
-                # JSON lỗi → rơi xuống trường hợp 2
-                pass
-
-        # Trường hợp 2: Không có JSON nhưng file đã tồn tại → quét lại
-        if os.path.exists(target) and os.path.getsize(target) > 0:
-            print(f"[TransferEngine] Không có file progress, đang quét lại SHA-256... (có thể mất vài phút)")
-            self.piece_manager.verify_all_pieces()
-            count = sum(1 for b in self.piece_manager.bitfield if b)
-            if count > 0:
-                print(f"[TransferEngine] Quét xong: tìm thấy {count}/{self.piece_manager.num_pieces} mảnh hợp lệ")
-
-        # Trường hợp 3: File mới rỗng → không cần làm gì (bitfield toàn False)
+        self.piece_manager.verify_all_pieces()
+        count = self.piece_manager.completed_pieces_count()
+        print(f"[TransferEngine] Đã xác minh trên đĩa: {count}/{self.piece_manager.num_pieces} mảnh")
 
 
     def stop(self) -> None:

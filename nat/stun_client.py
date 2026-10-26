@@ -21,6 +21,7 @@ import hmac
 import hashlib
 import logging
 import random
+import ipaddress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Tuple
@@ -328,6 +329,33 @@ class STUNClient:
         finally:
             if owns_socket:
                 sock.close()
+
+    def gather_candidates(self, sock: socket.socket, primary: NATInfo) -> list:
+        """Đo thêm ánh xạ từ chính socket đang dùng và giữ tối đa 4 ứng viên UDP.
+
+        Các địa chỉ STUN chỉ là ứng viên; kết nối thật phải được probe/ACK xác nhận.
+        """
+        candidates = []
+
+        def add(ip: str, port: int, kind: str) -> None:
+            try:
+                address = ipaddress.IPv4Address(ip)
+                if address.is_unspecified or not 1 <= port <= 65535:
+                    return
+            except (ipaddress.AddressValueError, TypeError):
+                return
+            if not any(c["ip"] == ip and c["port"] == port for c in candidates):
+                candidates.append({"ip": ip, "port": port, "type": kind})
+
+        add(primary.local_ip, sock.getsockname()[1], "host")
+        add(primary.public_ip, primary.public_port, "srflx")
+        for host, port in self.stun_servers:
+            if (host, port) == self.last_server or len(candidates) >= 4:
+                continue
+            mapped = _stun_request(sock, host, port, timeout=min(self.timeout, 0.8))
+            if mapped:
+                add(mapped[0], mapped[1], "srflx")
+        return candidates
 
     def get_nat_info(self) -> NATInfo:
         """

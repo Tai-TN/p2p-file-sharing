@@ -52,6 +52,10 @@ class PeerNode:
         with self._pm_lock:
             self._piece_managers[info_hash] = piece_manager
 
+    def get_piece_manager(self, info_hash: str) -> Optional[PieceManager]:
+        with self._pm_lock:
+            return self._piece_managers.get(info_hash)
+
     def remove_file(self, info_hash: str) -> bool:
         """Hủy đăng ký một file. Trả về True nếu file tồn tại và bị xóa."""
         with self._pm_lock:

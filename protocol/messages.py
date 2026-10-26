@@ -63,6 +63,8 @@ def recv_msg(sock) -> Optional[Dict[str, Any]]:
             return None
         
         msg_len = struct.unpack(">I", length_prefix)[0]
+        if not 0 < msg_len <= 2 * 1024 * 1024:
+            raise ValueError("Message vượt giới hạn 2 MiB")
         
         raw_json = recv_exact(sock, msg_len)
         if not raw_json:
@@ -157,7 +159,7 @@ def create_keepalive_msg() -> Dict[str, Any]:
 # ── NAT Traversal / Signaling message builders ────────────────────────────────
 
 def create_signal_register_msg(peer_id: str, ip: str, udp_port: int,
-                                tcp_port: int) -> Dict[str, Any]:
+                                tcp_port: int, candidates: list = None) -> Dict[str, Any]:
     """
     Peer gửi lên Tracker để mở kênh signaling persistent.
     - ip, udp_port: public endpoint từ STUN (dùng cho hole punch)
@@ -169,6 +171,7 @@ def create_signal_register_msg(peer_id: str, ip: str, udp_port: int,
         "ip":       ip,
         "udp_port": udp_port,
         "tcp_port": tcp_port,
+        "candidates": candidates or [],
     }
 
 
@@ -184,7 +187,7 @@ def create_punch_request_msg(target_peer_id: str) -> Dict[str, Any]:
 
 
 def create_punch_signal_msg(peer_id: str, ip: str, udp_port: int,
-                             tcp_port: int) -> Dict[str, Any]:
+                             tcp_port: int, candidates: list = None) -> Dict[str, Any]:
     """
     Tracker gửi cho peer để thông báo: có peer khác muốn kết nối tới bạn.
     - peer_id: ID của bên kia (để leecher biết punch với ai)
@@ -197,6 +200,7 @@ def create_punch_signal_msg(peer_id: str, ip: str, udp_port: int,
         "ip":       ip,
         "udp_port": udp_port,
         "tcp_port": tcp_port,
+        "candidates": candidates or [],
     }
 
 

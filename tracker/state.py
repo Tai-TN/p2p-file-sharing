@@ -87,6 +87,7 @@ class TrackerState:
                     "ip":       p_info["ip"],
                     "port":     p_info["port"],
                     "udp_port": p_info.get("udp_port", 0),   # 0 = peer này chưa có STUN
+                    "left":     p_info.get("left", 0),
                 })
 
             return active_peers
@@ -131,7 +132,8 @@ class TrackerState:
     # ── Signal channel management ─────────────────────────────────────────── #
 
     def register_signal_channel(self, peer_id: str, sock: Any,
-                                 ip: str, udp_port: int, tcp_port: int) -> None:
+                                 ip: str, udp_port: int, tcp_port: int,
+                                 candidates: Optional[list] = None) -> None:
         """
         Lưu socket signal channel persistent của một peer.
         Cũng lưu thêm endpoint vào một bảng riêng để PUNCH_REQUEST tra cứu.
@@ -149,6 +151,7 @@ class TrackerState:
                 "ip":       ip,
                 "udp_port": udp_port,
                 "tcp_port": tcp_port,
+                "candidates": candidates or [],
             }
         print(f"[Tracker State] Signal channel đã đăng ký: {peer_id} ({ip}:{udp_port} UDP)")
 

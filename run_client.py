@@ -46,6 +46,8 @@ def parse_args(argv=None):
         type=ipv4_address,
         help="IPv4 báo cho tracker (ví dụ IP Tailscale); mặc định dùng IP LAN",
     )
+    parser.add_argument("--transport", choices=("tcp", "udp"), default="tcp",
+                        help="tcp: Tailscale/LAN hiện tại; udp: thử trực tiếp qua NAT")
     args = parser.parse_args(argv)
     if not 1 <= args.listen_port <= 65535:
         parser.error("listen_port phải nằm trong khoảng 1–65535")
@@ -87,6 +89,7 @@ def main() -> None:
         tracker_host=args.tracker_host,
         tracker_port=args.tracker_port,
         advertise_ip=args.advertise_ip,
+        transport=args.transport,
     )
     client.start()
 

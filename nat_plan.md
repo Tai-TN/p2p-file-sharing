@@ -3,6 +3,11 @@
 > [!NOTE]
 > Dự án đã truyền file thành công qua Tailscale (VPN overlay). Bước tiếp theo là **xây dựng NAT traversal độc lập** — không cần Tailscale — bằng cách học theo kiến trúc mà Tailscale dùng bên dưới.
 
+> **Cập nhật 26/10/2026:** Sơ đồ và các bước bên dưới là bản kế hoạch cũ; đoạn
+> “TCP trên UDP socket đã hole punch” không khả thi. Source hiện thử kết nối trực
+> tiếp bằng nhiều ứng viên UDP và dùng chính UDP để truyền mảnh khi probe/ACK thành
+> công. Cách chạy và giới hạn thực tế ở `docs/KE_HOACH_P2P_INTERNET.md`.
+
 ---
 
 ## 1. Tailscale làm NAT traversal thế nào?
