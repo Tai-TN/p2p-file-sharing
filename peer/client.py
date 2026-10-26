@@ -167,7 +167,8 @@ class P2PClient:
                 # 1. Đục lỗ UDP
                 res = self._hole_punch_mgr.handle_punch_signal(msg)
                 if res.get("udp_success"):
-                    print(f"[P2PClient {self.peer_id}] Đục lỗ UDP tới {peer_id} thành công!")
+                    print(f"[P2PClient {self.peer_id}] Đục lỗ UDP tới {peer_id} thành công; "
+                          "truyền file hiện vẫn dùng TCP.")
 
                 # 2. Thử kết nối TCP từ các engine đang tải
                 with self._lock:

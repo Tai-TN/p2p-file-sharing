@@ -144,6 +144,23 @@ class TestHolePunch(unittest.TestCase):
                 mgr_a.close()
                 mgr_b.close()
 
+    def test_shared_socket_answers_probe_while_idle(self):
+        """Seeder phải đọc và ACK probe cả khi chưa nhận PUNCH_SIGNAL."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as seeder_sock, \
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as leecher_sock:
+            seeder_sock.bind(("127.0.0.1", 0))
+            leecher_sock.bind(("127.0.0.1", 0))
+            leecher_sock.settimeout(1.0)
+            mgr = HolePunchManager("seeder", seeder_sock.getsockname()[1])
+            mgr.set_socket(seeder_sock)
+            try:
+                leecher_sock.sendto(PROBE_PREFIX + b"leecher", seeder_sock.getsockname())
+                data, addr = leecher_sock.recvfrom(512)
+                self.assertEqual(data, ACK_PREFIX + b"seeder")
+                self.assertEqual(addr[1], seeder_sock.getsockname()[1])
+            finally:
+                mgr.close()
+
     def test_client_keeps_stun_socket_until_stop(self):
         client = P2PClient(peer_id="socket-owner", listen_port=0)
 

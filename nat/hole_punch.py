@@ -17,6 +17,7 @@ import time
 import socket
 import logging
 import threading
+import queue
 from typing import Optional, Tuple, Dict, Any
 
 from nat.stun_client import _build_binding_request, _build_transaction_id
@@ -35,10 +36,12 @@ class UDPHolePuncher:
     """
 
     def __init__(self, local_port: int, my_peer_id: str,
-                 shared_socket: Optional[socket.socket] = None):
+                 shared_socket: Optional[socket.socket] = None,
+                 incoming: Optional[queue.Queue] = None):
         self.local_port = local_port
         self.my_peer_id = my_peer_id
         self.shared_socket = shared_socket
+        self.incoming = incoming
 
     def punch(self, remote_ip: str, remote_udp_port: int,
               remote_peer_id: str = "", timeout: float = 3.0) -> Tuple[bool, Optional[socket.socket]]:
@@ -72,7 +75,8 @@ class UDPHolePuncher:
                 return False, None
 
         previous_timeout = sock.gettimeout()
-        sock.settimeout(0.08)  # timeout ngắn cho mỗi lần recv để liên tục gửi probe
+        if self.incoming is None:
+            sock.settimeout(0.08)  # chỉ puncher độc lập đọc trực tiếp từ socket
 
         probe_payload = f"{PROBE_PREFIX.decode()}{self.my_peer_id}".encode("utf-8")
         ack_payload   = f"{ACK_PREFIX.decode()}{self.my_peer_id}".encode("utf-8")
@@ -85,6 +89,8 @@ class UDPHolePuncher:
         got_peer_probe = False
         confirmed_ack = False
         keep_socket = False
+        sent_probes = 0
+        send_error = None
 
         logger.info(f"[UDPHolePuncher {self.my_peer_id}] Bắt đầu đục lỗ UDP tới {remote_ip}:{remote_udp_port}...")
 
@@ -93,20 +99,27 @@ class UDPHolePuncher:
                 # 1. Bắn probe ra ngoài (tạo outbound mapping trên NAT của mình)
                 try:
                     sock.sendto(probe_payload, target_addr)
+                    sent_probes += 1
                     if got_peer_probe:
                         # Nếu đã thấy probe của đối phương, bắn thêm ACK dồn dập
                         sock.sendto(ack_payload, target_addr)
                 except Exception as e:
+                    send_error = e
                     logger.debug(f"[UDPHolePuncher] Lỗi gửi probe: {e}")
 
                 # 2. Lắng nghe gói tin từ bên kia
                 try:
-                    data, addr = sock.recvfrom(512)
+                    if self.incoming is None:
+                        data, addr = sock.recvfrom(512)
+                    else:
+                        data, addr = self.incoming.get(timeout=0.08)
                     if not data:
                         continue
 
                     # Kiểm tra xem có phải gói từ đối phương không
                     if (data == expected_probe if expected_probe else data.startswith(PROBE_PREFIX)):
+                        if not got_peer_probe:
+                            logger.info(f"[UDPHolePuncher {self.my_peer_id}] Đã nhận probe UDP từ {addr}")
                         got_peer_probe = True
                         target_addr = addr  # peer có thể dùng port khác endpoint STUN dự đoán
                         # Gửi ACK phản hồi ngay lập tức
@@ -119,7 +132,7 @@ class UDPHolePuncher:
                         keep_socket = True
                         return True, sock
 
-                except socket.timeout:
+                except (socket.timeout, queue.Empty):
                     pass
                 except Exception as e:
                     logger.debug(f"[UDPHolePuncher] Lỗi khi nhận: {e}")
@@ -135,7 +148,9 @@ class UDPHolePuncher:
                 return False, None
 
             logger.warning(f"[UDPHolePuncher {self.my_peer_id}] Timeout đục lỗ UDP tới "
-                           f"{remote_ip}:{remote_udp_port}; không nhận được probe/ACK hợp lệ")
+                           f"{remote_ip}:{remote_udp_port}; đã gửi {sent_probes} probe, "
+                           f"không nhận được probe/ACK hợp lệ"
+                           + (f"; lỗi gửi cuối: {send_error}" if send_error else ""))
             return False, None
 
         except Exception as e:
@@ -145,7 +160,7 @@ class UDPHolePuncher:
             if owns_socket:
                 if not keep_socket:
                     sock.close()
-            else:
+            elif self.incoming is None:
                 sock.settimeout(previous_timeout)
 
 
@@ -164,6 +179,10 @@ class HolePunchManager:
         self._shared_socket: Optional[socket.socket] = None
         self._keepalive_stop = threading.Event()
         self._keepalive_thread: Optional[threading.Thread] = None
+        self._receive_thread: Optional[threading.Thread] = None
+        self._inboxes: Dict[str, queue.Queue] = {}
+        self._inboxes_lock = threading.Lock()
+        self._logged_probes: set[str] = set()
 
     def set_socket(self, sock: socket.socket,
                    stun_server: Optional[Tuple[str, int]] = None) -> None:
@@ -171,13 +190,71 @@ class HolePunchManager:
         with self._socket_lock:
             self._shared_socket = sock
             self.puncher.shared_socket = sock
+            sock.settimeout(0.2)
+        self._keepalive_stop.clear()
+        self._receive_thread = threading.Thread(
+            target=self._receive_loop, daemon=True,
+            name=f"udp-receive-{self.my_peer_id}",
+        )
+        self._receive_thread.start()
         if stun_server:
-            self._keepalive_stop.clear()
             self._keepalive_thread = threading.Thread(
                 target=self._keepalive_loop, args=(stun_server,), daemon=True,
                 name=f"udp-keepalive-{self.my_peer_id}",
             )
             self._keepalive_thread.start()
+
+    def _receive_loop(self) -> None:
+        """Luôn đọc UDP để tránh đầy hàng đợi và trả ACK cả lúc chưa punch."""
+        ack = ACK_PREFIX + self.my_peer_id.encode("utf-8")
+        while not self._keepalive_stop.is_set():
+            sock = self._shared_socket
+            if sock is None:
+                return
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._keepalive_stop.is_set():
+                    logger.warning(f"[HolePunchManager {self.my_peer_id}] Socket UDP đã đóng")
+                return
+
+            is_probe = data.startswith(PROBE_PREFIX)
+            if is_probe:
+                peer_bytes = data[len(PROBE_PREFIX):]
+            elif data.startswith(ACK_PREFIX):
+                peer_bytes = data[len(ACK_PREFIX):]
+            else:
+                continue  # phản hồi STUN hoặc gói không thuộc giao thức punch
+            if not (1 <= len(peer_bytes) <= 64 and all(
+                48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122 or b in (45, 95)
+                for b in peer_bytes
+            )):
+                continue
+            peer_id = peer_bytes.decode("ascii")
+
+            if is_probe:
+                if peer_id not in self._logged_probes and len(self._logged_probes) < 64:
+                    print(f"[HolePunchManager {self.my_peer_id}] Đã nhận probe UDP từ {peer_id} ({addr[0]}:{addr[1]})")
+                    self._logged_probes.add(peer_id)
+                try:
+                    sock.sendto(ack, addr)
+                except OSError:
+                    continue
+
+            with self._inboxes_lock:
+                inbox = self._inboxes.get(peer_id)
+                if inbox is not None:
+                    try:
+                        inbox.put_nowait((data, addr))
+                    except queue.Full:
+                        # Ưu tiên gói mới thay vì giữ probe cũ trong hàng đợi.
+                        try:
+                            inbox.get_nowait()
+                            inbox.put_nowait((data, addr))
+                        except queue.Empty:
+                            pass
 
     def _keepalive_loop(self, stun_server: Tuple[str, int]) -> None:
         while not self._keepalive_stop.wait(15.0):
@@ -193,13 +270,15 @@ class HolePunchManager:
 
     def close(self) -> None:
         self._keepalive_stop.set()
-        if self._keepalive_thread and self._keepalive_thread is not threading.current_thread():
-            self._keepalive_thread.join(timeout=1.0)
         with self._socket_lock:
             if self._shared_socket:
                 self._shared_socket.close()
                 self._shared_socket = None
                 self.puncher.shared_socket = None
+        if self._keepalive_thread and self._keepalive_thread is not threading.current_thread():
+            self._keepalive_thread.join(timeout=1.0)
+        if self._receive_thread and self._receive_thread is not threading.current_thread():
+            self._receive_thread.join(timeout=1.0)
 
     def handle_punch_signal(self, signal_msg: Dict[str, Any],
                             connect_tcp_callback=None) -> Dict[str, Any]:
@@ -227,12 +306,23 @@ class HolePunchManager:
         # 1. Khởi chạy đục lỗ UDP trong luồng hoặc trực tiếp
         if remote_udp > 0:
             with self._socket_lock:
-                success, udp_sock = self.puncher.punch(
-                    remote_ip=remote_ip,
-                    remote_udp_port=remote_udp,
-                    remote_peer_id=remote_peer_id,
-                    timeout=2.5
-                )
+                inbox = queue.Queue(maxsize=128) if self._shared_socket else None
+                if inbox is not None:
+                    with self._inboxes_lock:
+                        self._inboxes[remote_peer_id] = inbox
+                    self.puncher.incoming = inbox
+                try:
+                    success, udp_sock = self.puncher.punch(
+                        remote_ip=remote_ip,
+                        remote_udp_port=remote_udp,
+                        remote_peer_id=remote_peer_id,
+                        timeout=2.5
+                    )
+                finally:
+                    self.puncher.incoming = None
+                    if inbox is not None:
+                        with self._inboxes_lock:
+                            self._inboxes.pop(remote_peer_id, None)
             result["udp_success"] = success
             if udp_sock and udp_sock is not self._shared_socket:
                 try:
