@@ -25,6 +25,7 @@ class TransferEngine:
     và điều phối các Worker Thread để tải song song các mảnh (Pieces) còn thiếu.
     """
     HEARTBEAT_INTERVAL = 20.0
+    PUNCH_RETRY_INTERVAL = 30.0
 
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
@@ -50,6 +51,7 @@ class TransferEngine:
         self._announce_stop = threading.Event()
         self._announce_thread: Optional[threading.Thread] = None
         self._last_tracker_error: Optional[str] = None
+        self._next_punch_attempt: Dict[str, float] = {}
 
         # Quản lý danh sách các peer đã kết nối
         self.connected_peers: Dict[str, Dict] = {}
@@ -208,14 +210,17 @@ class TransferEngine:
             if not sock and self.signal_channel and getattr(self.signal_channel, "is_connected", False):
                 udp_port = p_info.get("udp_port", 0)
                 if udp_port:
-                    print(f"[TransferEngine {self.peer_id}] Kết nối trực tiếp tới {p_id} ({ip}:{port}) thất bại. Gửi PUNCH_REQUEST...")
-                    try:
-                        if self.signal_channel.request_punch(p_id):
-                            # Đợi 0.8s để tín hiệu PUNCH_SIGNAL và gói tin UDP probe mở lỗ NAT
-                            time.sleep(0.8)
-                            sock = self._connect_and_handshake(ip, port)
-                    except Exception as e:
-                        print(f"[TransferEngine {self.peer_id}] Lỗi khi yêu cầu đục lỗ NAT tới {p_id}: {e}")
+                    now = time.monotonic()
+                    with self.lock:
+                        should_request = now >= self._next_punch_attempt.get(p_id, 0.0)
+                        if should_request:
+                            self._next_punch_attempt[p_id] = now + self.PUNCH_RETRY_INTERVAL
+                    if should_request:
+                        print(f"[TransferEngine {self.peer_id}] Kết nối TCP tới {p_id} ({ip}:{port}) thất bại. Gửi PUNCH_REQUEST...")
+                        try:
+                            self.signal_channel.request_punch(p_id)
+                        except Exception as e:
+                            print(f"[TransferEngine {self.peer_id}] Lỗi khi yêu cầu đục lỗ NAT tới {p_id}: {e}")
 
             if not sock:
                 continue

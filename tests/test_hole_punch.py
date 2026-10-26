@@ -11,8 +11,13 @@ import time
 import socket
 import unittest
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from nat.hole_punch import UDPHolePuncher, HolePunchManager, PROBE_PREFIX, ACK_PREFIX
+from peer.client import P2PClient
+from peer.transfer_engine import TransferEngine
 
 
 def _free_udp_port() -> int:
@@ -22,6 +27,39 @@ def _free_udp_port() -> int:
 
 
 class TestHolePunch(unittest.TestCase):
+
+    def test_parallel_workers_send_one_punch_request(self):
+        pm = SimpleNamespace(metainfo={"info_hash": "sample"}, target_file_path="/tmp/sample")
+        signal = SimpleNamespace(is_connected=True, request_punch=Mock(return_value=True))
+        engine = TransferEngine("leecher", "127.0.0.1", 8000, 6882, pm,
+                                signal_channel=signal)
+        peer = {"peer_id": "seeder", "ip": "203.0.113.2", "port": 6881,
+                "udp_port": 28410}
+        with patch.object(engine, "_connect_and_handshake", return_value=None):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(lambda _: engine._update_peer_connections([peer]), range(4)))
+            engine._update_peer_connections([peer])
+        signal.request_punch.assert_called_once_with("seeder")
+
+    def test_duplicate_punch_signals_start_one_worker(self):
+        client = P2PClient(peer_id="seeder", advertise_ip="127.0.0.1")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_punch(_):
+            entered.set()
+            release.wait(timeout=2.0)
+            return {"udp_success": False}
+
+        msg = {"peer_id": "leecher", "ip": "203.0.113.2", "udp_port": 28410,
+               "tcp_port": 6882}
+        with patch.object(client._hole_punch_mgr, "handle_punch_signal",
+                          side_effect=slow_punch) as punch:
+            client._on_punch_signal(msg)
+            self.assertTrue(entered.wait(timeout=1.0))
+            client._on_punch_signal(msg)
+            release.set()
+            punch.assert_called_once_with(msg)
 
     def test_constants(self):
         self.assertTrue(PROBE_PREFIX.startswith(b"P2P_PUNCH:"))

@@ -2,6 +2,7 @@ import os
 import socket
 import random
 import threading
+import time
 from typing import Dict, List, Optional
 
 from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
@@ -58,6 +59,8 @@ class P2PClient:
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
         self._lock = threading.Lock()
+        self._punch_active: set[str] = set()
+        self._next_punch_signal: Dict[str, float] = {}
 
 
     def start(self) -> None:
@@ -140,26 +143,36 @@ class P2PClient:
         ip       = msg.get("ip", "?")
         udp_port = msg.get("udp_port", 0)
         tcp_port = msg.get("tcp_port", 0)
+        now = time.monotonic()
+        with self._lock:
+            if peer_id in self._punch_active or now < self._next_punch_signal.get(peer_id, 0.0):
+                return
+            self._punch_active.add(peer_id)
+            self._next_punch_signal[peer_id] = now + 30.0
         print(f"[P2PClient {self.peer_id}] PUNCH_SIGNAL: peer={peer_id} "
               f"UDP={ip}:{udp_port} TCP={tcp_port} → Bắt đầu đục lỗ...")
 
         def _punch_worker():
-            # 1. Đục lỗ UDP
-            res = self._hole_punch_mgr.handle_punch_signal(msg)
-            if res.get("udp_success"):
-                print(f"[P2PClient {self.peer_id}] Đục lỗ UDP tới {peer_id} thành công!")
+            try:
+                # 1. Đục lỗ UDP
+                res = self._hole_punch_mgr.handle_punch_signal(msg)
+                if res.get("udp_success"):
+                    print(f"[P2PClient {self.peer_id}] Đục lỗ UDP tới {peer_id} thành công!")
 
-            # 2. Thử kết nối TCP từ các engine đang tải
-            with self._lock:
-                engines = [t["engine"] for t in self._tasks.values() if "engine" in t]
-            for eng in engines:
-                if not eng.piece_manager.is_complete():
-                    eng._update_peer_connections([{
-                        "peer_id": peer_id,
-                        "ip": ip,
-                        "port": tcp_port,
-                        "udp_port": udp_port,
-                    }])
+                # 2. Thử kết nối TCP từ các engine đang tải
+                with self._lock:
+                    engines = [t["engine"] for t in self._tasks.values() if "engine" in t]
+                for eng in engines:
+                    if not eng.piece_manager.is_complete():
+                        eng._update_peer_connections([{
+                            "peer_id": peer_id,
+                            "ip": ip,
+                            "port": tcp_port,
+                            "udp_port": udp_port,
+                        }])
+            finally:
+                with self._lock:
+                    self._punch_active.discard(peer_id)
 
         t = threading.Thread(target=_punch_worker, daemon=True, name=f"punch-{peer_id}")
         t.start()
