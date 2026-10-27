@@ -1,97 +1,86 @@
-# Demo truyền file Linux → Android qua Tailscale
+# Thử truyền file trực tiếp qua IPv6
 
-## Mục tiêu và trạng thái
+## Trạng thái
 
-Mục tiêu của lần thử này là chạy tracker và seeder trên Linux, chạy leecher Python trong Termux trên Android, rồi tải file qua hai mạng Internet khác nhau. Hai thiết bị dùng cùng mạng Tailscale; không cần public IPv4 hay port forwarding. Đây là demo qua VPN, chưa phải tính năng xuyên NAT độc lập của ứng dụng.
+Nhánh `feature/direct-ipv6` dùng TCP IPv6 cho tracker và dữ liệu file, không dùng Tailscale, NAT traversal hay relay. Seeder và leecher công bố địa chỉ IPv6 với tracker; tracker chỉ giúp tìm peer. Bộ test `::1` đã kiểm tra truyền nhiều mảnh và SHA-256. **Chưa xác nhận truyền qua hai mạng Internet thật**: khi kiểm tra môi trường phát triển, Fedora chưa có IPv6 global.
 
-| Hạng mục | Trạng thái |
-| --- | --- |
-| Linux `taitn` trong Tailscale | Đã thấy IP `100.108.79.47` khi lập kế hoạch; kiểm tra lại bằng `tailscale ip -4` trước khi chạy. |
-| Android `v2352ga` trong Tailscale | Đã thấy IP `100.82.132.18`; người dùng đã quan sát `tailscale status` báo `direct` trong lúc truyền file. |
-| Code và kiểm thử trên Linux | Có `--advertise-ip`, heartbeat cho seeder và `--tailscale` để tự lấy IP trên Fedora; `python3 -m unittest discover tests` đạt 8/8 bài test, gồm truyền file qua socket localhost. |
-| Gói source và file mẫu | Commit `92ba2fc` có gói `demo_workspace/p2p-file-sharing-src.tar.gz` và file mẫu; gói đó được tạo trước tùy chọn `--tailscale`. Tạo lại gói nếu muốn Android dùng cùng source mới. |
-| Termux và Python trên Android | Người dùng đã gửi log Termux cho thấy kết nối tới seeder và nhận các mảnh file. |
-| Truyền file Linux → Android và đối chiếu SHA-256 | Người dùng báo đã tải thành công và Fedora hiển thị đường `direct`; chưa lưu kết quả SHA-256 hai file trong tài liệu này. |
+Nhánh `demo/tailscale` giữ bản demo cũ. Hai nhánh dùng cùng cấu trúc `.meta.json`, nhưng chương trình trên nhánh IPv6 chỉ nhận địa chỉ IPv6.
 
-Tailscale có thể dùng relay khi NAT chặn đường kết nối trực tiếp: <https://tailscale.com/docs/reference/device-connectivity>.
+## Điều kiện mạng
 
-## Các bước thực hiện
+- Fedora chạy tracker và seeder phải có IPv6 công khai (global unicast), ví dụ một địa chỉ thuộc dải `2000::/3`. `fe80::/10` chỉ dùng trên liên kết cục bộ và `fd00::/8` không phải địa chỉ Internet công khai.
+- Android leecher dùng **mạng di động riêng** có IPv6. Không kiểm chứng Internet bằng cách nối Fedora vào hotspot của chính điện thoại leecher.
+- Cổng TCP `8000` (tracker) và `6881` (seeder) trên Fedora phải nhận được kết nối từ Android. Kiểm tra firewall Fedora và firewall IPv6 của router/hotspot. Leecher chỉ cần kết nối đi để tải từ seeder; để làm seeder cho máy khác, Android cũng cần cho kết nối đi vào cổng của nó.
+- Tắt Tailscale trên cả hai thiết bị khi thử. Nếu mạng không cấp IPv6 công khai hoặc chặn kết nối đi vào, dừng kết luận ở mức “đã chạy trên `::1`”; code không thể tự mở đường qua firewall.
 
-### 1. Chuẩn bị Android
+## Chạy trên Fedora
 
-1. Cài Termux từ F-Droid hoặc bản phát hành GitHub theo hướng dẫn của dự án: <https://github.com/termux/termux-app#installation>. Không trộn ứng dụng Termux và plugin lấy từ các nguồn khác nhau.
-2. Giữ Tailscale trên điện thoại ở trạng thái Connected. Tắt Wi-Fi và dùng dữ liệu di động để thử hai mạng khác nhau.
-3. Trong Termux, chạy lần lượt:
+1. Xem IPv6 của interface đang dùng:
 
    ```sh
-   pkg update
-   pkg install python
-   python --version
-   termux-setup-storage
+   ip -6 -brief address show scope global
    ```
 
-   Chấp nhận quyền truy cập bộ nhớ khi Android hỏi. Nếu Termux không truy cập được IP Tailscale, kiểm tra Termux có bị loại khỏi VPN trong cài đặt split tunneling của Tailscale không: <https://tailscale.com/docs/features/client/android-app-split-tunneling>.
+   Chọn địa chỉ IPv6 công khai của Fedora làm `FEDORA_IPV6` trong các lệnh dưới. Địa chỉ có thể thay đổi khi đổi mạng; kiểm tra lại trước mỗi lần thử.
 
-### 2. Chuyển source đang dùng sang Android
+2. Nếu dùng `firewalld`, mở hai cổng cho phiên thử và kiểm tra thêm firewall IPv6 của router:
 
-Source trên Linux hiện có thể chứa thay đổi chưa commit; vì vậy dùng bản source thực tế đang thử. Gói ở commit `92ba2fc` chứa code cũ. Tạo gói mới từ thư mục gốc dự án bằng:
+   ```sh
+   sudo firewall-cmd --add-port=8000/tcp --add-port=6881/tcp
+   ```
 
-```sh
-tar --exclude='__pycache__' --exclude='*.pyc' -czf /tmp/p2p-file-sharing-tailscale-src.tar.gz run_client.py run_tracker.py peer protocol storage demo_workspace/shared/internet-demo.bin.meta.json
-```
+3. Tại thư mục gốc dự án, chạy tracker ở terminal thứ nhất:
 
-Chép gói `/tmp/p2p-file-sharing-tailscale-src.tar.gz` bằng USB vào thư mục `Download` trên điện thoại. Gói chỉ chứa code và metadata, không chứa file gốc cần tải. Trong Termux:
+   ```sh
+   python3 run_tracker.py
+   ```
 
-```sh
-mkdir -p ~/p2p-file-sharing
-tar -xzf ~/storage/downloads/p2p-file-sharing-tailscale-src.tar.gz -C ~/p2p-file-sharing
-cd ~/p2p-file-sharing
-```
+   Tracker lắng nghe IPv6 tại `[::]:8000`.
 
-Nếu tên thư mục trên điện thoại khác `Download`, tìm gói bằng ứng dụng Files rồi chép vào `Download` trước khi giải nén.
+4. Tạo file mẫu mới để ứng dụng tạo `.meta.json` chứa địa chỉ tracker IPv6; giữ file gốc trên Fedora:
 
-### 3. Chạy tracker và seeder trên Linux
+   ```sh
+   dd if=/dev/urandom of=/tmp/ipv6-demo.bin bs=1M count=4
+   sha256sum /tmp/ipv6-demo.bin
+   python3 run_client.py 6881 FEDORA_IPV6
+   ```
 
-Kiểm tra Tailscale đang kết nối bằng `tailscale status`; lấy IP Fedora bằng `tailscale ip -4` để điền vào lệnh trên cả hai máy. `--tailscale` trên Fedora tự đọc IP này và báo cho tracker, không tự bật Tailscale. Nếu daemon chưa chạy, dùng `sudo systemctl start tailscaled`, sau đó `sudo tailscale up`. Các lệnh dưới dùng IP đã thấy lúc lập kế hoạch; thay IP tracker nếu thiết bị được cấp địa chỉ khác.
+   Trong menu chọn `1`, nhập `/tmp/ipv6-demo.bin`. Metadata sẽ được tạo tại `demo_workspace/shared/ipv6-demo.bin.meta.json`. Giữ client chạy và đợi hơn 120 giây trước khi thử tải nếu muốn kiểm tra heartbeat của seeder.
 
-Terminal thứ nhất:
+Mặc định tracker công bố IPv6 nguồn thấy trên kết nối `ANNOUNCE`; dòng `Tracker đã công bố IPv6 [...]` cho biết địa chỉ thực tế. Nếu máy có nhiều IPv6 và tracker chọn địa chỉ không nhận được kết nối từ ngoài, chạy lại client với `--advertise-ip FEDORA_IPV6`.
 
-```sh
-python3 run_tracker.py
-```
+## Chạy trên Android/Termux
 
-Terminal thứ hai:
+1. Bật dữ liệu di động, tắt Wi-Fi và Tailscale. Chuẩn bị Python trong Termux (`pkg install python`) và cho phép truy cập thư mục Download nếu cần (`termux-setup-storage`).
+2. Chép **source cùng file `.meta.json`**, không chép `/tmp/ipv6-demo.bin`, sang điện thoại. Ví dụ tạo gói trên Fedora:
 
-```sh
-python3 run_client.py 6881 100.108.79.47 --tailscale
-```
+   ```sh
+   tar --exclude='__pycache__' --exclude='*.pyc' -czf /tmp/p2p-ipv6-src.tar.gz run_client.py peer protocol storage demo_workspace/shared/ipv6-demo.bin.meta.json
+   ```
 
-Trong menu, chọn `1` và nhập đường dẫn tuyệt đối của file mẫu `demo_workspace/internet-demo.bin` (1,5 MiB, gồm 3 mảnh). Có thể lấy đường dẫn bằng `realpath demo_workspace/internet-demo.bin` từ terminal Linux. Metadata đã được chuẩn bị tại `demo_workspace/shared/internet-demo.bin.meta.json`; client sẽ kiểm tra file nguồn và bắt đầu chia sẻ. Giữ tracker và seeder đang chạy. Đợi hơn 120 giây trước khi bắt đầu tải để kiểm tra heartbeat có giữ seeder trên tracker hay không.
+   Chép gói sang thư mục Download qua USB, sau đó giải nén trong Termux:
 
-Khi Android bắt đầu tải, chọn `3` trên Fedora để xem tiến độ và kết quả `tailscale status`. Dòng `direct` hoặc `relay` là đường Tailscale đang dùng tại thời điểm kiểm tra; ứng dụng không chờ `direct` mới truyền file. Nếu CLI thiếu, chưa kết nối hoặc không trả IPv4 hợp lệ, `--tailscale` báo lỗi ngay khi khởi động. Không dùng `--tailscale` đồng thời với `--advertise-ip`.
+   ```sh
+   mkdir -p ~/p2p-file-sharing
+   tar -xzf ~/storage/downloads/p2p-ipv6-src.tar.gz -C ~/p2p-file-sharing
+   cd ~/p2p-file-sharing
+   ```
 
-### 4. Chạy leecher trên Android
+3. Trước khi tải, kiểm tra Android thực sự mở được kết nối TCP IPv6 tới Fedora. Thay `FEDORA_IPV6` bằng địa chỉ thật trong mỗi lệnh:
 
-File metadata đã có trong gói source vừa giải nén. **Không chép `internet-demo.bin`** sang điện thoại; file nguồn phải được tải qua ứng dụng P2P.
+   ```sh
+   python -c 'import socket; s=socket.socket(socket.AF_INET6); s.settimeout(5); s.connect(("FEDORA_IPV6",8000)); print("Tracker OK"); s.close()'
+   python -c 'import socket; s=socket.socket(socket.AF_INET6); s.settimeout(5); s.connect(("FEDORA_IPV6",6881)); print("Seeder OK"); s.close()'
+   ```
 
-Trong Termux, tại `~/p2p-file-sharing`, chạy:
+4. Chạy `python run_client.py 6882 FEDORA_IPV6`, chọn `2` và nhập `demo_workspace/shared/ipv6-demo.bin.meta.json`. File nhận ở `demo_workspace/downloads/ipv6-demo.bin`.
 
-```sh
-python run_client.py 6882 100.108.79.47 --advertise-ip 100.82.132.18
-```
+5. Chạy `sha256sum demo_workspace/downloads/ipv6-demo.bin` trên Android và so với kết quả trên Fedora. Ghi lại log `Tracker đã công bố IPv6`, `Kết nối P2P thành công`, tỷ lệ mảnh và SHA-256.
 
-Ứng dụng Tailscale Android không cung cấp CLI chính thức cho Termux, nên xem IPv4 Android trong ứng dụng Tailscale rồi nhập bằng `--advertise-ip` như trên.
+Nếu Android kết nối tracker được nhưng không kết nối seeder, kiểm tra lại địa chỉ IPv6 seeder được công bố, cổng 6881 và firewall/router. Nếu cả hai cổng không kết nối được, kiểm tra IPv6 công khai và cổng 8000 trước. `ping -6` thành công không thay thế kiểm tra cổng TCP.
 
-Trong menu, chọn `2` và nhập đường dẫn tuyệt đối in bởi `realpath ~/p2p-file-sharing/demo_workspace/shared/internet-demo.bin.meta.json`. Chọn `3` để theo dõi tiến độ; file nhận ở `demo_workspace/downloads/internet-demo.bin` trong thư mục dự án trên Termux.
+## Giới hạn hiện tại
 
-### 5. Xác minh
-
-Trên Linux, chạy `sha256sum demo_workspace/internet-demo.bin`. Trong Termux, chạy `sha256sum ~/p2p-file-sharing/demo_workspace/downloads/internet-demo.bin`. Hai chuỗi SHA-256 phải trùng nhau; với file mẫu đã tạo, giá trị mong đợi là `e6193b4df0ded214f49ca1b46e1a13b7564293cc9efe8525c17814da96a1b6b5`. Ghi lại thời điểm bắt đầu, kết quả và log lỗi nếu có.
-
-Nếu không tải được, kiểm tra theo thứ tự: Tailscale Connected ở cả hai máy; IP Fedora dùng làm địa chỉ tracker có đổi không; Termux có đi qua VPN không; tracker đang nghe cổng TCP 8000; seeder đang nghe cổng TCP 6881; dòng `IP máy này` trên seeder có đúng IP Tailscale không. `tailscale ping` chỉ kiểm tra đường mạng ảo, chưa chứng minh cổng ứng dụng đang mở.
-
-## Giới hạn và bước sau demo
-
-- Relay Tailscale giúp thử chức năng trên mạng không mở được cổng, nhưng tốc độ có thể thấp hơn đường trực tiếp.
-- Tracker và giao thức P2P của dự án chưa có xác thực riêng. Chỉ chạy demo trong mạng Tailscale của các thiết bị tin cậy.
-- Nếu muốn người dùng không cần cài Tailscale, cần thiết kế và triển khai relay hoặc cơ chế xuyên NAT trong ứng dụng ở giai đoạn sau.
+- Chưa có đường dự phòng khi một trong hai mạng không hỗ trợ IPv6 hoặc chặn kết nối TCP đi vào.
+- Tracker và peer chưa có xác thực riêng; chỉ dùng file thử không nhạy cảm trên mạng có kiểm soát.
+- Kết quả test `::1` chỉ xác nhận code chạy cục bộ, không chứng minh truyền được giữa hai mạng Internet.

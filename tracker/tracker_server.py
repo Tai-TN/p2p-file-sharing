@@ -3,6 +3,7 @@ import threading
 import time
 from typing import Optional
 from protocol.messages import MessageType, send_msg, recv_msg
+from protocol.ipv6 import normalize_ipv6_address
 from .state import TrackerState
 
 
@@ -12,9 +13,9 @@ class TrackerServer:
     """
 
     def __init__(
-        self, host: str = "127.0.0.1", port: int = 8000, peer_timeout: float = 60.0
+        self, host: str = "::1", port: int = 8000, peer_timeout: float = 60.0
     ):
-        self.host = host
+        self.host = normalize_ipv6_address(host)
         self.port = port
         self.state = TrackerState(peer_timeout=peer_timeout)
         self.server_socket: Optional[socket.socket] = None
@@ -24,16 +25,17 @@ class TrackerServer:
 
     def start(self) -> None:
         """Khởi động máy chủ Tracker Server và luồng dọn dẹp định kỳ."""
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         self.server_socket.setsockopt(
             socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
-        )  # Ipv4, TCP
+        )
+        self.server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(128)  # # -> Listening socket, tối đa 128 người chờ
         self.is_running = True
 
         print(
-            f"[Tracker Server] Đang khởi chạy và lắng nghe tại {self.host}:{self.port}"
+            f"[Tracker Server] Đang khởi chạy và lắng nghe tại [{self.host}]:{self.port}"
         )
 
         # Khởi chạy luồng dọn dẹp Peer dead định kỳ (Background daemon thread)
@@ -79,10 +81,21 @@ class TrackerServer:
                 downloaded = msg.get("downloaded", 0)
                 left = msg.get("left", 0)
 
-                # Ưu tiên IP do peer tự báo (IP thật trong LAN).
-                # Nếu không có, dùng IP từ kết nối TCP (fallback).
-                announced_ip = msg.get("ip", "").strip()
-                peer_ip = announced_ip if announced_ip else client_ip
+                announced_ip = msg.get("ip", "")
+                if (not isinstance(announced_ip, str)
+                        or not isinstance(peer_port, int) or isinstance(peer_port, bool)
+                        or not 1 <= peer_port <= 65535
+                        or not isinstance(info_hash, str) or not info_hash
+                        or not isinstance(peer_id, str) or not peer_id):
+                    send_msg(conn, {"type": MessageType.ANNOUNCE_RESPONSE.value,
+                                    "status": "ERROR", "error": "ANNOUNCE không hợp lệ"})
+                    return
+                try:
+                    peer_ip = normalize_ipv6_address(announced_ip or client_ip)
+                except ValueError:
+                    send_msg(conn, {"type": MessageType.ANNOUNCE_RESPONSE.value,
+                                    "status": "ERROR", "error": "Địa chỉ IPv6 không hợp lệ"})
+                    return
 
                 # Đăng ký thông tin peer
                 self.state.register_peer(
@@ -100,6 +113,7 @@ class TrackerServer:
                     "type": MessageType.ANNOUNCE_RESPONSE.value,
                     "status": "OK",
                     "interval": 30,  # Peer nên announce lại mỗi 30 giây
+                    "ip": peer_ip,
                 }
                 send_msg(conn, response)
 

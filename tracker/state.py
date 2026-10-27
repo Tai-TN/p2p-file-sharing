@@ -38,7 +38,7 @@ class TrackerState:
                 "left": left,
                 "last_seen": time.time()
             }
-            print(f"[Tracker State] Cập nhật Peer {peer_id} ({ip}:{port}) cho file {info_hash[:8]}... (event={event})")
+            print(f"[Tracker State] Cập nhật Peer {peer_id} ([{ip}]:{port}) cho file {info_hash[:8]}... (event={event})")
             return True
 
     def get_peers(self, info_hash: str, exclude_peer_id: Optional[str] = None) -> List[Dict[str, Any]]:

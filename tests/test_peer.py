@@ -50,23 +50,23 @@ class TestPeer(unittest.TestCase):
         leecher_port = 7002
 
         # 1. Khởi chạy Tracker Server
-        tracker = TrackerServer(host="127.0.0.1", port=tracker_port, peer_timeout=10.0)
+        tracker = TrackerServer(host="::1", port=tracker_port, peer_timeout=10.0)
         tracker.start()
         time.sleep(0.1)
 
         try:
             # 2. Tạo metainfo cho file mẫu
-            meta = create_metainfo(self.sample_file_path, piece_length=self.piece_length, tracker_url=f"127.0.0.1:{tracker_port}")
+            meta = create_metainfo(self.sample_file_path, piece_length=self.piece_length, tracker_url=f"[::1]:{tracker_port}")
 
             # 3. Khởi chạy Seeder (Có file mẫu 100%)
             seeder_pm = PieceManager(self.sample_file_path, meta)
             seeder_pm.verify_all_pieces()
             self.assertTrue(seeder_pm.is_complete())
 
-            seeder_node = PeerNode("seeder_01", "127.0.0.1", seeder_port, seeder_pm)
+            seeder_node = PeerNode("seeder_01", "::1", seeder_port, seeder_pm)
             seeder_node.start_listening()
 
-            seeder_engine = TransferEngine("seeder_01", "127.0.0.1", tracker_port, seeder_port, seeder_pm)
+            seeder_engine = TransferEngine("seeder_01", "::1", tracker_port, seeder_port, seeder_pm)
             seeder_engine._announce_to_tracker(event="started")
             self.addCleanup(seeder_engine.stop)
 
@@ -75,10 +75,10 @@ class TestPeer(unittest.TestCase):
             leecher_pm = PieceManager(download_file_path, meta)
             self.assertFalse(leecher_pm.is_complete())
 
-            leecher_node = PeerNode("leecher_01", "127.0.0.1", leecher_port, leecher_pm)
+            leecher_node = PeerNode("leecher_01", "::1", leecher_port, leecher_pm)
             leecher_node.start_listening()
 
-            leecher_engine = TransferEngine("leecher_01", "127.0.0.1", tracker_port, leecher_port, leecher_pm, max_workers=2)
+            leecher_engine = TransferEngine("leecher_01", "::1", tracker_port, leecher_port, leecher_pm, max_workers=2)
             self.addCleanup(leecher_engine.stop)
 
             # Khởi động tải P2P
@@ -107,24 +107,24 @@ class TestPeer(unittest.TestCase):
             file.write(source_data)
         meta = create_metainfo(source, piece_length=512 * 1024)
 
-        tracker = TrackerServer(host="127.0.0.1", port=0)
+        tracker = TrackerServer(host="::1", port=0)
         tracker.start()
         tracker_port = tracker.server_socket.getsockname()[1]
 
         seeder_pm = PieceManager(source, meta)
         seeder_pm.verify_all_pieces()
-        seeder_node = PeerNode("parallel-seeder", "127.0.0.1", 0, seeder_pm)
+        seeder_node = PeerNode("parallel-seeder", "::1", 0, seeder_pm)
         seeder_node.start_listening()
         seeder_port = seeder_node.server_socket.getsockname()[1]
-        seeder_engine = TransferEngine("parallel-seeder", "127.0.0.1", tracker_port,
+        seeder_engine = TransferEngine("parallel-seeder", "::1", tracker_port,
                                        seeder_port, seeder_pm)
 
         download_path = os.path.join(self.test_dir, "parallel-download.dat")
         leecher_pm = PieceManager(download_path, meta)
-        leecher_node = PeerNode("parallel-leecher", "127.0.0.1", 0, leecher_pm)
+        leecher_node = PeerNode("parallel-leecher", "::1", 0, leecher_pm)
         leecher_node.start_listening()
         leecher_port = leecher_node.server_socket.getsockname()[1]
-        leecher_engine = TransferEngine("parallel-leecher", "127.0.0.1", tracker_port,
+        leecher_engine = TransferEngine("parallel-leecher", "::1", tracker_port,
                                         leecher_port, leecher_pm, max_workers=4)
 
         active = 0

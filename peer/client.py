@@ -1,5 +1,4 @@
 import os
-import socket
 import random
 import threading
 from typing import Dict, List, Optional
@@ -8,18 +7,7 @@ from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
 from storage.piece_manager import PieceManager
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
-
-
-def get_local_ip() -> str:
-    """Lấy IP thực của máy trong mạng LAN."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+from protocol.ipv6 import normalize_ipv6_address
 
 
 class P2PClient:
@@ -30,18 +18,17 @@ class P2PClient:
     """
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
-                 tracker_host: str = "127.0.0.1", tracker_port: int = 8000,
+                 tracker_host: str = "::1", tracker_port: int = 8000,
                  advertise_ip: Optional[str] = None):
         self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
         self.listen_port = listen_port
-        self.tracker_host = tracker_host
+        self.tracker_host = normalize_ipv6_address(tracker_host)
         self.tracker_port = tracker_port
 
-        # Địa chỉ mà peer khác dùng để kết nối tới máy này.
-        self.my_ip = advertise_ip if advertise_ip is not None else get_local_ip()
+        # Nếu không ghi đè, tracker lấy IPv6 nguồn từ kết nối ANNOUNCE.
+        self.my_ip = normalize_ipv6_address(advertise_ip) if advertise_ip else ""
 
-        # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi máy trong LAN
-        self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port)
+        self.node = PeerNode(peer_id=self.peer_id, host="::", port=listen_port)
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
@@ -52,8 +39,8 @@ class P2PClient:
         """Mở cổng TCP và sẵn sàng nhận kết nối từ Peer khác."""
         self.node.start_listening()
         print(f"[P2PClient {self.peer_id}] Đã khởi động")
-        print(f"  IP máy này : {self.my_ip}:{self.listen_port}")
-        print(f"  Tracker    : {self.tracker_host}:{self.tracker_port}")
+        print(f"  IPv6 công bố: {self.my_ip or 'tracker tự xác định khi ANNOUNCE'}")
+        print(f"  Tracker     : [{self.tracker_host}]:{self.tracker_port}")
 
     def stop(self) -> None:
         """Dừng tất cả engine, hủy đăng ký với Tracker, đóng kết nối."""
@@ -90,7 +77,7 @@ class P2PClient:
             print(f"[P2PClient] Đang tạo metadata (tính SHA-256)...")
             meta = create_metainfo(
                 source_file,
-                tracker_url=f"{self.tracker_host}:{self.tracker_port}"
+                tracker_url=f"[{self.tracker_host}]:{self.tracker_port}"
             )
             save_metainfo(meta, meta_output_path)
             print(f"[P2PClient] Đã tạo metadata: {os.path.basename(meta_output_path)}")

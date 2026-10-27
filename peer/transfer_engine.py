@@ -17,6 +17,7 @@ from protocol.messages import (
     create_request_msg
 )
 from .selection import choose_next_piece
+from protocol.ipv6 import normalize_ipv6_address
 
 class TransferEngine:
     """
@@ -30,12 +31,13 @@ class TransferEngine:
                  listen_port: int, piece_manager: PieceManager,
                  max_workers: int = 4, my_ip: str = ""):
         self.peer_id = peer_id
-        self.tracker_host = tracker_host
+        self.tracker_host = normalize_ipv6_address(tracker_host)
         self.tracker_port = tracker_port
         self.listen_port = listen_port
         self.piece_manager = piece_manager
         self.max_workers = max_workers
-        self.my_ip = my_ip          # IP thực của máy — báo cho Tracker để peer khác kết nối đúng chỗ
+        self.my_ip = normalize_ipv6_address(my_ip) if my_ip else ""
+        self.announced_ip = ""
         self.info_hash = piece_manager.metainfo["info_hash"]
 
         self.is_running = False
@@ -127,12 +129,12 @@ class TransferEngine:
                 info_hash=self.info_hash,
                 peer_id=self.peer_id,
                 port=self.listen_port,
-                ip=self.my_ip,          # IP thực để Tracker lưu đúng địa chỉ
+                ip=self.my_ip,          # Rỗng để Tracker dùng IPv6 nguồn của kết nối TCP.
                 event=event,
                 downloaded=downloaded_bytes,
                 left=left_bytes
             )
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5.0)
                 sock.connect((self.tracker_host, self.tracker_port))
                 if not send_msg(sock, msg):
@@ -141,18 +143,26 @@ class TransferEngine:
 
             if not isinstance(resp, dict) or resp.get("type") != MessageType.ANNOUNCE_RESPONSE.value:
                 return []
+            if resp.get("status") != "OK":
+                print(f"[TransferEngine {self.peer_id}] Tracker từ chối ANNOUNCE: {resp.get('error', 'không rõ lỗi')}")
+                return []
+            reported_ip = resp.get("ip")
+            if reported_ip and reported_ip != self.announced_ip:
+                self.announced_ip = reported_ip
+                print(f"[TransferEngine {self.peer_id}] Tracker đã công bố IPv6 [{reported_ip}]:{self.listen_port}")
 
             if event == "stopped" or self.piece_manager.is_complete():
                 return []
 
             return self._get_peers_from_tracker()
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            print(f"[TransferEngine {self.peer_id}] Không kết nối được tracker IPv6: {exc}")
             return []
 
     def _get_peers_from_tracker(self) -> List[Dict]:
         """Chỉ luồng điều phối hỏi tracker; các worker không gọi tracker."""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5.0)
                 sock.connect((self.tracker_host, self.tracker_port))
                 if not send_msg(sock, create_get_peers_msg(self.info_hash, self.peer_id)):
@@ -193,7 +203,12 @@ class TransferEngine:
             port = p_info.get("port")
 
             if (not isinstance(p_id, str) or not p_id or not isinstance(ip, str)
-                    or not ip or not isinstance(port, int) or not 1 <= port <= 65535):
+                    or not isinstance(port, int) or isinstance(port, bool)
+                    or not 1 <= port <= 65535):
+                continue
+            try:
+                ip = normalize_ipv6_address(ip)
+            except ValueError:
                 continue
 
             # Kiểm tra nhanh trong lock (không làm network ở đây)
@@ -224,13 +239,13 @@ class TransferEngine:
             for old_sock in old_sockets:
                 self._close_socket(old_sock)
             if self.is_running:
-                print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
+                print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ([{ip}]:{port})")
 
     def _open_peer_session(self, ip: str, port: int) -> Optional[Tuple[socket.socket, List[bool]]]:
         """Mở một TCP session độc lập và nhận bitfield của peer."""
         sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             sock.settimeout(5.0)
             sock.connect((ip, port))
             with self.lock:
