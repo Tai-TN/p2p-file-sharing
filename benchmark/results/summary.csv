@@ -1,0 +1,4 @@
+strategy,avg_finish_round,last_finish_round,all_pieces_out_of_seeder_round,pct_done_seeder_leaves_r25,pct_done_seeder_leaves_r30,pct_done_seeder_leaves_r35,pct_done_seeder_leaves_r40,pct_done_seeder_leaves_r45,pct_done_seeder_leaves_r50,pct_done_seeder_leaves_r55,pct_done_seeder_leaves_r60
+Rarest-First,54.4,58.3,30.9,0.0,35.0,100.0,100.0,100.0,100.0,100.0,100.0
+Random,54.2,58,42.1,0.0,0.0,0.0,30.0,95.0,100.0,100.0,100.0
+Sequential,118.9,119.9,116.6,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
