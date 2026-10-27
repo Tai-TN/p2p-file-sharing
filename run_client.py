@@ -5,13 +5,17 @@ Cách chạy:
     python run_client.py                        # localhost, cổng 6881
     python run_client.py 6882                   # cổng tùy chọn
     python run_client.py 6881 192.168.1.10      # qua mạng LAN
-    python run_client.py 6881 100.108.79.47 --advertise-ip 100.108.79.47
-                                                # qua Tailscale
+    python run_client.py 6881 100.108.79.47 --tailscale
+                                                # Fedora qua Tailscale
+    python run_client.py 6882 100.108.79.47 --advertise-ip 100.82.132.18
+                                                # Android/Termux qua Tailscale
 """
 import argparse
 import ipaddress
+import json
 import os
 import random
+import subprocess
 from peer.client import P2PClient
 
 # ── Cấu hình ──
@@ -30,14 +34,61 @@ def ipv4_address(value: str) -> str:
         raise argparse.ArgumentTypeError(f"IPv4 không hợp lệ: {value}") from exc
 
 
+def tailscale_command(*args: str) -> str:
+    """Chạy CLI Tailscale trên Fedora với thời gian chờ hữu hạn."""
+    try:
+        result = subprocess.run(
+            ["tailscale", *args], capture_output=True, text=True,
+            timeout=5, check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Không tìm thấy CLI tailscale trên máy này") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("CLI tailscale không phản hồi sau 5 giây") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(detail or "CLI tailscale trả về lỗi") from exc
+    return result.stdout.strip()
+
+
+def get_tailscale_ip() -> str:
+    """Lấy IPv4 của Fedora khi thiết bị đã kết nối vào tailnet."""
+    try:
+        status = json.loads(tailscale_command("status", "--json"))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("Không đọc được trạng thái Tailscale") from exc
+    if not isinstance(status, dict) or status.get("BackendState") != "Running":
+        raise RuntimeError("Tailscale chưa kết nối; hãy chạy 'sudo tailscale up'")
+
+    raw_ip = tailscale_command("ip", "-4")
+    try:
+        return str(ipaddress.IPv4Address(raw_ip))
+    except ipaddress.AddressValueError as exc:
+        raise RuntimeError(f"CLI tailscale trả IPv4 không hợp lệ: {raw_ip!r}") from exc
+
+
+def show_tailscale_status() -> None:
+    """Hiển thị đường direct/relay hiện tại, không ảnh hưởng tới việc tải file."""
+    try:
+        print("\n  Trạng thái Tailscale hiện tại:")
+        print(tailscale_command("status"))
+    except RuntimeError as exc:
+        print(f"  Không xem được trạng thái Tailscale: {exc}")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="P2P client chia sẻ file")
     parser.add_argument("listen_port", nargs="?", type=int, default=6881)
     parser.add_argument("tracker_host", nargs="?", default="127.0.0.1")
-    parser.add_argument(
+    ip_options = parser.add_mutually_exclusive_group()
+    ip_options.add_argument(
         "--advertise-ip",
         type=ipv4_address,
         help="IPv4 báo cho tracker (ví dụ IP Tailscale); mặc định dùng IP LAN",
+    )
+    ip_options.add_argument(
+        "--tailscale", action="store_true",
+        help="Fedora: tự lấy IPv4 Tailscale để báo cho tracker",
     )
     args = parser.parse_args(argv)
     if not 1 <= args.listen_port <= 65535:
@@ -59,6 +110,11 @@ def print_menu(peer_id: str, listen_port: int, tracker_host: str) -> None:
 def main() -> None:
     args = parse_args()
     peer_id = f"peer_{random.randint(1000, 9999)}"
+    if args.tailscale:
+        try:
+            args.advertise_ip = get_tailscale_ip()
+        except RuntimeError as exc:
+            raise SystemExit(f"Lỗi Tailscale: {exc}") from exc
 
     client = P2PClient(
         peer_id=peer_id,
@@ -113,6 +169,8 @@ def main() -> None:
                     print(f"  {'-'*80}")
                     for t in tasks:
                         print(f"  {t['name'][:28]:<30} {t['type']:<8} {t['progress']:<9} {t['pieces']:<16} {t['status']}")
+                if args.tailscale:
+                    show_tailscale_status()
 
             elif choice == "4":
                 break
