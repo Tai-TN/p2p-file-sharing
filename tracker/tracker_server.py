@@ -66,6 +66,7 @@ class TrackerServer:
     def _handle_client(self, conn: socket.socket, addr: tuple) -> None:
         """Xử lý yêu cầu từ một Peer kết nối đến."""
         try:
+            conn.settimeout(5.0)
             msg = recv_msg(conn)
             if not msg:
                 return
@@ -80,13 +81,16 @@ class TrackerServer:
                 event = msg.get("event", "started")
                 downloaded = msg.get("downloaded", 0)
                 left = msg.get("left", 0)
+                bad_peers = msg.get("bad_peers", [])
 
                 announced_ip = msg.get("ip", "")
                 if (not isinstance(announced_ip, str)
                         or not isinstance(peer_port, int) or isinstance(peer_port, bool)
                         or not 1 <= peer_port <= 65535
                         or not isinstance(info_hash, str) or not info_hash
-                        or not isinstance(peer_id, str) or not peer_id):
+                        or not isinstance(peer_id, str) or not peer_id
+                        or not isinstance(bad_peers, list) or len(bad_peers) > 256
+                        or not all(isinstance(peer, str) and peer for peer in bad_peers)):
                     send_msg(conn, {"type": MessageType.ANNOUNCE_RESPONSE.value,
                                     "status": "ERROR", "error": "ANNOUNCE không hợp lệ"})
                     return
@@ -107,6 +111,14 @@ class TrackerServer:
                     left=left,
                     event=event,
                 )
+
+                # Xử lý báo cáo peer chết từ Leecher
+                if bad_peers:
+                    self.state.report_bad_peers(
+                        info_hash=info_hash,
+                        reporter_id=peer_id,
+                        bad_peer_ids=bad_peers
+                    )
 
                 # Trả về phản hồi thành công
                 response = {
@@ -132,6 +144,8 @@ class TrackerServer:
                 }
                 send_msg(conn, response)
 
+        except EOFError:
+            pass  # A connectivity check or client may close without sending a frame.
         except Exception as e:
             print(f"[Tracker Server] Lỗi xử lý client {addr}: {e}")
         finally:

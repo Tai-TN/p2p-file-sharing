@@ -2,7 +2,15 @@ import json
 import struct
 import base64
 from enum import Enum
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+
+# Limit framed input before allocating/reading its body (default pieces are 512 KiB).
+MAX_MESSAGE_SIZE = 64 * 1024 * 1024
+
+
+class ProtocolError(ValueError):
+    """A complete frame has invalid length, UTF-8, JSON or message shape."""
+
 
 class MessageType(str, Enum):
     # Tracker Messages
@@ -21,7 +29,7 @@ class MessageType(str, Enum):
     KEEP_ALIVE = "KEEP_ALIVE"
     ERROR = "ERROR"
 
-def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
+def recv_exact(sock, num_bytes: int) -> bytes:
     """
     Hàm bổ trợ đọc chính xác N bytes từ TCP Socket.
     """
@@ -30,46 +38,43 @@ def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
         chunk = sock.recv(num_bytes - len(buf)) # Số byte còn thiếu vẫn cần nhận
         if not chunk:
             # Socket bị đóng hoặc hỏng kết nối khi chưa đọc đủ data
-            return None
+            raise EOFError("Socket đóng trước khi nhận đủ thông điệp")
         buf.extend(chunk)
     return bytes(buf)
 
 def send_msg(sock, payload: Dict[str, Any]) -> bool:
-    try:
-        raw_json = json.dumps(payload).encode('utf-8') # dump : Chuyển Dict -> Json
-        length_prefix = struct.pack(">I", len(raw_json)) # Đóng gói thành 1 chuỗi nhị phân
-        sock.sendall(length_prefix + raw_json)
-        return True
-    except Exception as e:
-        print(f"[Protocol Error] Lỗi khi gửi message: {e}")
-        return False
+    raw_json = json.dumps(payload).encode('utf-8') # dump : Chuyển Dict -> Json
+    if not 0 < len(raw_json) <= MAX_MESSAGE_SIZE:
+        raise ProtocolError("Kích thước thông điệp vượt giới hạn")
+    length_prefix = struct.pack(">I", len(raw_json)) # Đóng gói thành 1 chuỗi nhị phân
+    sock.sendall(length_prefix + raw_json)
+    return True
 
 
-
-def recv_msg(sock) -> Optional[Dict[str, Any]]:
+def recv_msg(sock) -> Dict[str, Any]:
     """
     Nhận 1 thông điệp JSON hoàn chỉnh từ socket bằng quy tắc Length-prefix framing.
     """
+    length_prefix = recv_exact(sock, 4)
+    msg_len = struct.unpack(">I", length_prefix)[0]
+    if not 0 < msg_len <= MAX_MESSAGE_SIZE:
+        raise ProtocolError("Độ dài thông điệp không hợp lệ")
+    raw_json = recv_exact(sock, msg_len)
     try:
-        length_prefix = recv_exact(sock, 4)
-        if not length_prefix:
-            return None
-        
-        msg_len = struct.unpack(">I", length_prefix)[0]
-        
-        raw_json = recv_exact(sock, msg_len)
-        if not raw_json:
-            return None
-        
-        return json.loads(raw_json.decode('utf-8'))
-    except Exception as e:
-        print(f"[Protocol Error] Lỗi khi nhận message: {e}")
-        return None
+        result = json.loads(raw_json.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ProtocolError("JSON không hợp lệ") from e
+
+    if not isinstance(result, dict):
+        raise ProtocolError("Thông điệp JSON phải là object")
+
+    return result
 
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 
 def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
-                        event: str = "started", downloaded: int = 0, left: int = 0) -> Dict[str, Any]:
+                        event: str = "started", downloaded: int = 0, left: int = 0,
+                        bad_peers: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
         "type": MessageType.ANNOUNCE.value,
         "info_hash": info_hash,
@@ -78,7 +83,8 @@ def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
         "port": port,
         "event": event,
         "downloaded": downloaded,
-        "left": left
+        "left": left,
+        "bad_peers": bad_peers or []  # Danh sách peer_id bị xác nhận là chết
     }
 
 def create_get_peers_msg(info_hash: str, peer_id: str) -> Dict[str, Any]:

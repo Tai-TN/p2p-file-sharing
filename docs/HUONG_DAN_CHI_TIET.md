@@ -31,9 +31,13 @@ File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-shari
 
 ### 1.1. Các hàm xử lý Socket Framing
 
-- **`recv_exact(sock, num_bytes) -> Optional[bytes]`**: Đọc đúng và đủ `num_bytes` từ socket TCP để giải quyết triệt để vấn đề xé gói (Fragmentation).
+- **`recv_exact(sock, num_bytes) -> bytes`**: Đọc đúng và đủ `num_bytes` từ socket TCP để giải quyết triệt để vấn đề xé gói (Fragmentation).
 - **`send_msg(sock, payload: dict) -> bool`**: Đóng gói Dictionary JSON với **4-byte length prefix** (Big-Endian) trước khi gửi qua TCP socket.
-- **`recv_msg(sock) -> Optional[dict]`**: Đọc 4 byte tiêu đề $\rightarrow$ giải mã lấy độ dài $L$ $\rightarrow$ đọc tiếp đúng $L$ bytes nội dung $\rightarrow$ `json.loads()`.
+- **`recv_msg(sock) -> dict`**: Đọc 4 byte tiêu đề $\rightarrow$ giải mã lấy độ dài $L$ $\rightarrow$ đọc tiếp đúng $L$ bytes nội dung $\rightarrow$ `json.loads()`.
+
+Sau khi ghép `main` vào nhánh IPv6, `recv_msg()` trả `dict` khi thành công và **ném exception khi lỗi**, theo cách báo lỗi của `main`: `EOFError` nếu socket đóng giữa header/body; `OSError` hoặc `socket.timeout` nếu lỗi mạng; `ProtocolError` (kế thừa `ValueError`) nếu độ dài frame, UTF-8, JSON hoặc kiểu thông điệp không hợp lệ. `send_msg()` trả `True` khi thành công và để lỗi truyền ra bên gọi. Frame được giới hạn 64 MiB trước khi đọc body; giao thức length-prefix và dữ liệu Base64 giữ nguyên.
+
+Engine bắt các lỗi này tại bước tracker, handshake và tải mảnh. Mất kết nối loại peer hiện tại khỏi danh sách đang tải, đóng các socket thuộc peer đó và tạm tránh trong 120 giây. Dữ liệu sai được đếm chung giữa các worker; sau 4 lần lỗi, peer cũng bị tạm loại. Báo cáo `bad_peers` chỉ được gỡ khỏi hàng chờ sau khi tracker xác nhận ANNOUNCE; tracker cần báo cáo từ 2 peer khác nhau để xóa peer bị báo cáo khỏi swarm. Lỗi ghi dữ liệu hợp lệ trên máy nhận không được tính thành lỗi của seeder.
 
 ### 1.2. Danh sách Message Builders
 
