@@ -2,9 +2,7 @@ import os
 import json
 import time
 import socket
-import base64
 import hashlib
-import random
 import threading
 from typing import Dict, List, Optional, Tuple
 from storage.piece_manager import PieceManager
@@ -12,6 +10,7 @@ from protocol.messages import (
     MessageType,
     send_msg,
     recv_msg,
+    recv_piece_data,
     create_announce_msg,
     create_get_peers_msg,
     create_handshake_msg,
@@ -58,6 +57,9 @@ class TransferEngine:
 
         # Đánh dấu các piece đang được tải (tránh 2 luồng tải trùng piece)
         self.in_flight_pieces: set = set()
+
+        # Round-robin counter: tránh nhiều worker pile vào cùng 1 seeder
+        self._peer_rr_index: int = 0
 
         # Đường dẫn file lưu vết tiến độ resume
         self.progress_file = f"{piece_manager.target_file_path}.progress.json"
@@ -302,7 +304,11 @@ class TransferEngine:
         sock.close()
 
     def _reserve_piece_locked(self) -> Optional[Tuple[int, str, str, int]]:
-        """Chọn peer và giữ chỗ mảnh trong cùng một lần giữ self.lock."""
+        """Chọn peer và giữ chỗ mảnh trong cùng một lần giữ self.lock.
+
+        Dùng round-robin để phân phối đều workers sang các seeder khác nhau,
+        tránh tình huống nhiều worker cùng pile vào 1 seeder khi có nhiều seeder.
+        """
         peer_bitfields = {peer_id: info["bitfield"] for peer_id, info in self.connected_peers.items()}
         missing = [piece for piece in self.piece_manager.missing_pieces()
                    if piece not in self.in_flight_pieces]
@@ -313,7 +319,11 @@ class TransferEngine:
                   if info["bitfield"][piece_index]]
         if not owners:
             return None
-        peer_id, info = random.choice(owners)
+        # Round-robin: ưu tiên seeder theo thứ tự vòng tròn thay vì random
+        # Giúp phân tải đều khi có nhiều seeder cùng bitfield
+        pick_idx = self._peer_rr_index % len(owners)
+        self._peer_rr_index += 1
+        peer_id, info = owners[pick_idx]
         self.in_flight_pieces.add(piece_index)
         return piece_index, peer_id, info["ip"], info["port"]
 
@@ -427,9 +437,14 @@ class TransferEngine:
             sock.settimeout(15.0)
             send_msg(sock, create_request_msg(piece_index))
             resp = recv_msg(sock)
-            if not isinstance(resp, dict) or resp.get("type") != MessageType.PIECE.value or resp.get("piece_index") != piece_index:
+            if not isinstance(resp, dict) or resp.get("type") != MessageType.PIECE.value:
                 raise ValueError("Thiếu hoặc sai phản hồi PIECE")
-            piece_data = base64.b64decode(resp.get("data"), validate=True)
+            try:
+                recv_idx, piece_data = recv_piece_data(sock, resp)
+            except Exception as exc:
+                raise ValueError(f"Lỗi đọc dữ liệu piece: {exc}") from exc
+            if recv_idx != piece_index:
+                raise ValueError(f"piece_index không khớp: nhận {recv_idx}, mong {piece_index}")
             try:
                 written = self.piece_manager.write_piece(piece_index, piece_data)
             except OSError as exc:

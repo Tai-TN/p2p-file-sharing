@@ -1,11 +1,14 @@
 import json
 import struct
 import base64
+import socket as _socket
 from enum import Enum
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 # Limit framed input before allocating/reading its body (default pieces are 512 KiB).
 MAX_MESSAGE_SIZE = 64 * 1024 * 1024
+# Giới hạn kích thước binary payload (piece data) — mặc định 512 KiB * 4 an toàn
+MAX_BINARY_PAYLOAD = 4 * 1024 * 1024
 
 
 class ProtocolError(ValueError):
@@ -32,14 +35,16 @@ class MessageType(str, Enum):
 def recv_exact(sock, num_bytes: int) -> bytes:
     """
     Hàm bổ trợ đọc chính xác N bytes từ TCP Socket.
+    Dùng memoryview để tránh copy bytes nhiều lần khi nhận dữ liệu lớn.
     """
-    buf = bytearray()
-    while len(buf) < num_bytes:
-        chunk = sock.recv(num_bytes - len(buf)) # Số byte còn thiếu vẫn cần nhận
-        if not chunk:
-            # Socket bị đóng hoặc hỏng kết nối khi chưa đọc đủ data
+    buf = bytearray(num_bytes)
+    view = memoryview(buf)
+    received = 0
+    while received < num_bytes:
+        n = sock.recv_into(view[received:], num_bytes - received)
+        if not n:
             raise EOFError("Socket đóng trước khi nhận đủ thông điệp")
-        buf.extend(chunk)
+        received += n
     return bytes(buf)
 
 def send_msg(sock, payload: Dict[str, Any]) -> bool:
@@ -125,14 +130,61 @@ def create_request_msg(piece_index: int) -> Dict[str, Any]:
 
 def create_piece_msg(piece_index: int, data_bytes: bytes) -> Dict[str, Any]:
     """
-    Mã hóa binary chunk data thành Base64 string để truyền an toàn qua JSON protocol.
+    Tạo PIECE message header. Dùng binary transfer (size field) thay vì Base64.
+    Giao thức binary: [4B JSON len][JSON header với size=N][N raw bytes data]
+    Hàm này chỉ tạo header JSON; gọi send_piece() để gửi đồng thời header + data.
     """
-    encoded_data = base64.b64encode(data_bytes).decode('utf-8')
     return {
         "type": MessageType.PIECE.value,
         "piece_index": piece_index,
-        "data": encoded_data
+        "size": len(data_bytes),   # Báo hiệu binary transfer — không dùng base64
     }
+
+
+def send_piece(sock, piece_index: int, data_bytes: bytes) -> None:
+    """
+    Gửi PIECE message theo binary framing:
+      [4B JSON len][JSON header {type, piece_index, size}][raw bytes]
+    Không dùng Base64 → tiết kiệm 33% bandwidth và CPU.
+    """
+    header = create_piece_msg(piece_index, data_bytes)
+    raw_json = json.dumps(header).encode('utf-8')
+    if not 0 < len(raw_json) <= MAX_MESSAGE_SIZE:
+        raise ProtocolError("Kích thước header PIECE vượt giới hạn")
+    data_len = len(data_bytes)
+    if not 0 < data_len <= MAX_BINARY_PAYLOAD:
+        raise ProtocolError("Kích thước binary payload PIECE vượt giới hạn")
+    # Gửi 1 lần: length_prefix + JSON + raw bytes (giảm số syscall)
+    sock.sendall(struct.pack(">I", len(raw_json)) + raw_json + data_bytes)
+
+
+def recv_piece_data(sock, header: Dict[str, Any]) -> Tuple[int, bytes]:
+    """
+    Đọc binary payload của PIECE message sau khi đã đọc header JSON bằng recv_msg().
+    Trả về (piece_index, raw_bytes).
+    Hỗ trợ backward-compat: nếu header có 'data' (base64) thì decode, không đọc thêm socket.
+    """
+    piece_index = header.get("piece_index")
+    if not isinstance(piece_index, int) or isinstance(piece_index, bool) or piece_index < 0:
+        raise ProtocolError("piece_index không hợp lệ trong PIECE header")
+
+    # Binary path (mới): header có 'size'
+    if "size" in header:
+        data_len = header["size"]
+        if not isinstance(data_len, int) or isinstance(data_len, bool) or not 0 < data_len <= MAX_BINARY_PAYLOAD:
+            raise ProtocolError("Kích thước binary payload không hợp lệ")
+        data = recv_exact(sock, data_len)
+        return piece_index, data
+
+    # Base64 path (cũ — backward compat):
+    encoded = header.get("data")
+    if not isinstance(encoded, str):
+        raise ProtocolError("PIECE header thiếu 'size' và 'data'")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ProtocolError("Base64 decode lỗi") from exc
+    return piece_index, data
 
 def create_keepalive_msg() -> Dict[str, Any]:
     return {

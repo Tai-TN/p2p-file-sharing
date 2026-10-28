@@ -1,4 +1,5 @@
 import hashlib
+import io
 import os
 import socket
 import struct
@@ -9,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
-from protocol.messages import MessageType, create_piece_msg, send_msg
+from protocol.messages import MessageType, create_piece_msg, send_msg, send_piece
 from storage.metainfo import create_metainfo
 from storage.piece_manager import PieceManager
 from tracker.state import TrackerState
@@ -58,33 +59,49 @@ class TestTransferErrors(unittest.TestCase):
                 bad_port = nodes[0].server_socket.getsockname()[1]
                 bad_requests = []
 
-                def faulty_send(sock, message):
-                    if (message.get("type") == MessageType.PIECE.value
-                            and sock.getsockname()[1] == bad_port):
-                        bad_requests.append(message["piece_index"])
+                def faulty_send_piece(sock, piece_idx, data_bytes):
+                    """Seeder 'bad' gửi dữ liệu lỗi; seeder 'good' gửi bình thường."""
+                    from protocol.messages import send_piece as _sp
+                    if sock.getsockname()[1] == bad_port:
+                        bad_requests.append(piece_idx)
                         if mode == "eof":
                             sock.sendall(struct.pack(">I", 1000) + b'{"type":')
                             sock.shutdown(socket.SHUT_WR)
-                            return True
+                            return
                         if mode == "json":
                             sock.sendall(struct.pack(">I", 8) + b'{"type":')
-                            return True
-                        return send_msg(sock, create_piece_msg(
-                            message["piece_index"], b"x" * meta["info"]["piece_length"]))
-                    return send_msg(sock, message)
+                            return
+                        # mode == "hash": gửi binary đúng size nhưng nội dung sai
+                        _sp(sock, piece_idx, b"x" * meta["info"]["piece_length"])
+                        return
+                    _sp(sock, piece_idx, data_bytes)
 
-                def prefer_bad(options):
-                    if isinstance(options[0], tuple):
-                        return next((item for item in options if item[0] == "bad"), options[0])
-                    return options[0]
+                def prefer_bad_reserve(self_engine):
+                    """Ưu tiên peer 'bad' khi có nhiều lựa chọn."""
+                    from peer.selection import choose_next_piece
+                    peer_bitfields = {pid: info["bitfield"]
+                                      for pid, info in self_engine.connected_peers.items()}
+                    missing = [p for p in self_engine.piece_manager.missing_pieces()
+                               if p not in self_engine.in_flight_pieces]
+                    piece_index = choose_next_piece(missing, peer_bitfields, strategy="rarest_first")
+                    if piece_index is None:
+                        return None
+                    owners = [(pid, info) for pid, info in self_engine.connected_peers.items()
+                              if info["bitfield"][piece_index]]
+                    if not owners:
+                        return None
+                    chosen = next(((pid, info) for pid, info in owners if pid == "bad"), owners[0])
+                    peer_id, info = chosen
+                    self_engine.in_flight_pieces.add(piece_index)
+                    return piece_index, peer_id, info["ip"], info["port"]
 
                 target = os.path.join(root, "download.dat")
                 pm = PieceManager(target, meta)
                 leecher = TransferEngine("leecher", "::1", tracker_port, 6882, pm, max_workers=2)
                 outcome = []
                 thread = threading.Thread(target=lambda: outcome.append(leecher.start_download()), daemon=True)
-                with patch("peer.peer_node.send_msg", side_effect=faulty_send), \
-                     patch("peer.transfer_engine.random.choice", side_effect=prefer_bad):
+                with patch("peer.peer_node.send_piece", side_effect=faulty_send_piece), \
+                     patch.object(TransferEngine, "_reserve_piece_locked", prefer_bad_reserve):
                     thread.start()
                     thread.join(timeout=10)
                     self.assertFalse(thread.is_alive(), "Worker died or download got stuck")
@@ -135,8 +152,9 @@ class TestTransferErrors(unittest.TestCase):
     def test_local_write_failure_does_not_penalize_peer(self):
         with tempfile.TemporaryDirectory() as root:
             source = os.path.join(root, "file.dat")
+            piece_data = b"valid piece"
             with open(source, "wb") as stream:
-                stream.write(b"valid piece")
+                stream.write(piece_data)
             pm = PieceManager(source, create_metainfo(source))
             engine = TransferEngine("leecher", "::1", 8000, 6882, pm)
             sock = Mock()
@@ -145,10 +163,12 @@ class TestTransferErrors(unittest.TestCase):
                 "ip": "::1", "port": 6881, "bitfield": [True],
                 "sockets": {0: sock}, "spare_socket": None, "bad_data_count": 0,
             }
-            response = create_piece_msg(0, b"valid piece")
+            # Patch recv_piece_data để trả về dữ liệu hợp lệ mà không cần đọc socket thật
+            response = create_piece_msg(0, piece_data)
             with patch.object(engine, "_worker_socket", return_value=sock), \
                  patch("peer.transfer_engine.send_msg"), \
-                 patch("peer.transfer_engine.recv_msg", return_value=response):
+                 patch("peer.transfer_engine.recv_msg", return_value=response), \
+                 patch("peer.transfer_engine.recv_piece_data", return_value=(0, piece_data)):
                 for failure in (False, OSError("disk full")):
                     with self.subTest(failure=failure):
                         options = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}

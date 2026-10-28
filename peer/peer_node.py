@@ -8,7 +8,7 @@ from protocol.messages import (
     send_msg,
     recv_msg,
     create_bitfield_msg,
-    create_piece_msg,
+    send_piece,
 )
 from protocol.ipv6 import normalize_ipv6_address
 
@@ -166,7 +166,7 @@ class PeerNode:
                     if piece_idx is not None:
                         data = pm.read_piece(piece_idx)
                         if data:
-                            send_msg(conn, create_piece_msg(piece_idx, data))
+                            send_piece(conn, piece_idx, data)
 
                 elif req_type == MessageType.KEEP_ALIVE.value:
                     pass  # Không làm gì, chỉ để giữ kết nối sống

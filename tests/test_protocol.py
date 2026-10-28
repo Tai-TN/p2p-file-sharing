@@ -41,6 +41,6 @@ class TestProtocolErrors(unittest.TestCase):
         sock.sendall.side_effect = BrokenPipeError("closed")
         with self.assertRaises(BrokenPipeError):
             send_msg(sock, {"type": "REQUEST"})
-        sock.recv.side_effect = socket.timeout("no response")
+        sock.recv_into.side_effect = socket.timeout("no response")
         with self.assertRaises(socket.timeout):
             recv_msg(sock)
