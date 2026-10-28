@@ -14,7 +14,9 @@ from .messages import (
     create_have_msg,
     create_request_msg,
     create_piece_msg,
-    create_keepalive_msg
+    create_keepalive_msg,
+    send_piece,
+    recv_piece_data,
 )
 # xác định những tên được xem là API public của package.
 """
@@ -33,5 +35,7 @@ __all__ = [
     'create_have_msg',
     'create_request_msg',
     'create_piece_msg',
-    'create_keepalive_msg'
+    'create_keepalive_msg',
+    'send_piece',
+    'recv_piece_data',
 ]

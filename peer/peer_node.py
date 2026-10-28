@@ -1,6 +1,6 @@
 import socket
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from storage.piece_manager import PieceManager
 from protocol.messages import (
@@ -8,8 +8,9 @@ from protocol.messages import (
     send_msg,
     recv_msg,
     create_bitfield_msg,
-    create_piece_msg,
+    send_piece,
 )
+from protocol.ipv6 import normalize_ipv6_address
 
 
 class PeerNode:
@@ -25,7 +26,7 @@ class PeerNode:
     def __init__(self, peer_id: str, host: str, port: int,
                  piece_manager: Optional[PieceManager] = None):
         self.peer_id = peer_id
-        self.host = host
+        self.host = normalize_ipv6_address(host)
         self.port = port
 
         # Bảng quản lý file: { info_hash: PieceManager }
@@ -42,7 +43,7 @@ class PeerNode:
         self.is_running = False
 
         # Danh sách socket đang kết nối đến từ Peer khác: { addr: socket }
-        self._active_sockets: Dict[Tuple[str, int], socket.socket] = {}
+        self._active_sockets: Dict[tuple, socket.socket] = {}
         self._sock_lock = threading.Lock()
 
     # ── Quản lý file ──────────────────────────────────────────────────── #
@@ -64,13 +65,14 @@ class PeerNode:
 
     def start_listening(self) -> None:
         """Mở cổng TCP và bắt đầu chấp nhận kết nối ngầm."""
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(64)
         self.is_running = True
 
-        print(f"[PeerNode {self.peer_id}] Lắng nghe tại {self.host}:{self.port}")
+        print(f"[PeerNode {self.peer_id}] Lắng nghe tại [{self.host}]:{self.port}")
 
         t = threading.Thread(target=self._accept_loop, daemon=True)
         t.start()
@@ -116,14 +118,14 @@ class PeerNode:
 
     # ── Xử lý từng kết nối Peer ─────────────────────────────────────── #
 
-    def _handle_peer_connection(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+    def _handle_peer_connection(self, conn: socket.socket, addr: tuple) -> None:
         """
         Phục vụ 1 kết nối P2P theo giao thức:
           1. Nhận HANDSHAKE → tra info_hash → tìm PieceManager
           2. Gửi HANDSHAKE_RESPONSE + BITFIELD
           3. Lặp nhận REQUEST → gửi PIECE (hoặc bỏ qua KEEP_ALIVE)
         """
-        conn.settimeout(60.0)  # Tự đóng nếu Peer ngắt kết nối hoặc im lặng quá 60 giây
+        conn.settimeout(180.0)  # Tự đóng nếu Peer ngắt kết nối hoặc im lặng quá 60 giây
 
         with self._sock_lock:
             self._active_sockets[addr] = conn
@@ -164,7 +166,7 @@ class PeerNode:
                     if piece_idx is not None:
                         data = pm.read_piece(piece_idx)
                         if data:
-                            send_msg(conn, create_piece_msg(piece_idx, data))
+                            send_piece(conn, piece_idx, data)
 
                 elif req_type == MessageType.KEEP_ALIVE.value:
                     pass  # Không làm gì, chỉ để giữ kết nối sống

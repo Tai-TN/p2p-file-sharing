@@ -1,5 +1,4 @@
 import os
-import socket
 import random
 import threading
 from typing import Dict, List, Optional
@@ -8,18 +7,7 @@ from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
 from storage.piece_manager import PieceManager
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
-
-
-def get_local_ip() -> str:
-    """Lấy IP thực của máy trong mạng LAN."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+from protocol.ipv6 import normalize_ipv6_address
 
 
 class P2PClient:
@@ -27,27 +15,20 @@ class P2PClient:
     Kiến trúc bên trong:
     - 1 PeerNode duy nhất lắng nghe trên listen_port (đóng vai Server upload).
     - Nhiều TransferEngine chạy ngầm, mỗi engine phụ trách 1 file đang download.
-
-    Quy tắc P2P thực sự:
-    - Khi bắt đầu DOWNLOAD một file, PieceManager của file đó được đăng ký
-      vào PeerNode NGAY LẬP TỨC → vừa tải vừa sẵn sàng chia sẻ những mảnh
-      đã có cho các Peer khác trong swarm.
-    - Khi tải xong 100%, engine chỉ cần announce "completed" lên Tracker.
-      PeerNode tiếp tục phục vụ upload mà không cần làm thêm gì.
     """
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
-                 tracker_host: str = "127.0.0.1", tracker_port: int = 8000):
+                 tracker_host: str = "::1", tracker_port: int = 8000,
+                 advertise_ip: Optional[str] = None):
         self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
         self.listen_port = listen_port
-        self.tracker_host = tracker_host
+        self.tracker_host = normalize_ipv6_address(tracker_host)
         self.tracker_port = tracker_port
 
-        # IP thực của máy — báo cho Tracker để peer khác biết kết nối vào đâu
-        self.my_ip = get_local_ip()
+        # Nếu không ghi đè, tracker lấy IPv6 nguồn từ kết nối ANNOUNCE.
+        self.my_ip = normalize_ipv6_address(advertise_ip) if advertise_ip else ""
 
-        # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi máy trong LAN
-        self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port)
+        self.node = PeerNode(peer_id=self.peer_id, host="::", port=listen_port)
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
@@ -58,8 +39,8 @@ class P2PClient:
         """Mở cổng TCP và sẵn sàng nhận kết nối từ Peer khác."""
         self.node.start_listening()
         print(f"[P2PClient {self.peer_id}] Đã khởi động")
-        print(f"  IP máy này : {self.my_ip}:{self.listen_port}")
-        print(f"  Tracker    : {self.tracker_host}:{self.tracker_port}")
+        print(f"  IPv6 công bố: {self.my_ip or 'tracker tự xác định khi ANNOUNCE'}")
+        print(f"  Tracker     : [{self.tracker_host}]:{self.tracker_port}")
 
     def stop(self) -> None:
         """Dừng tất cả engine, hủy đăng ký với Tracker, đóng kết nối."""
@@ -69,11 +50,11 @@ class P2PClient:
         for task in snapshot:
             engine: TransferEngine = task["engine"]
             try:
-                engine._announce_to_tracker(event="stopped")
+                engine.stop()
             except Exception:
                 pass
             try:
-                engine.stop()
+                engine._announce_to_tracker(event="stopped")
             except Exception:
                 pass
 
@@ -96,7 +77,7 @@ class P2PClient:
             print(f"[P2PClient] Đang tạo metadata (tính SHA-256)...")
             meta = create_metainfo(
                 source_file,
-                tracker_url=f"{self.tracker_host}:{self.tracker_port}"
+                tracker_url=f"[{self.tracker_host}]:{self.tracker_port}"
             )
             save_metainfo(meta, meta_output_path)
             print(f"[P2PClient] Đã tạo metadata: {os.path.basename(meta_output_path)}")
@@ -122,7 +103,7 @@ class P2PClient:
         # Đăng ký vào PeerNode → các Peer khác có thể xin mảnh
         self.node.add_file(info_hash, pm)
 
-        # Tạo engine chỉ để Announce lên Tracker (không tải gì)
+        # Seeder cũng cần heartbeat để không hết hạn trên tracker.
         engine = TransferEngine(
             peer_id=self.peer_id,
             tracker_host=self.tracker_host,
@@ -131,7 +112,7 @@ class P2PClient:
             piece_manager=pm,
             my_ip=self.my_ip,
         )
-        engine._announce_to_tracker(event="started")
+        engine.start_announcing()
 
         with self._lock:
             self._tasks[info_hash] = {

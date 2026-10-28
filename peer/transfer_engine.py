@@ -2,8 +2,7 @@ import os
 import json
 import time
 import socket
-import base64
-import random
+import hashlib
 import threading
 from typing import Dict, List, Optional, Tuple
 from storage.piece_manager import PieceManager
@@ -11,68 +10,76 @@ from protocol.messages import (
     MessageType,
     send_msg,
     recv_msg,
+    recv_piece_data,
     create_announce_msg,
     create_get_peers_msg,
     create_handshake_msg,
     create_request_msg
 )
 from .selection import choose_next_piece
+from protocol.ipv6 import normalize_ipv6_address
 
 class TransferEngine:
     """
     Động cơ chuyển tải file P2P: Quản lý việc kết nối đến Tracker, kết nối trực tiếp đến các Peer khác,
     và điều phối các Worker Thread để tải song song các mảnh (Pieces) còn thiếu.
     """
+    HEARTBEAT_INTERVAL = 20.0
+    DISCOVERY_INTERVAL = 2.0
+    PEER_RETRY_INTERVAL = 120.0
+    MAX_BAD_DATA = 4
+
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
                  max_workers: int = 4, my_ip: str = ""):
         self.peer_id = peer_id
-        self.tracker_host = tracker_host
+        self.tracker_host = normalize_ipv6_address(tracker_host)
         self.tracker_port = tracker_port
         self.listen_port = listen_port
         self.piece_manager = piece_manager
         self.max_workers = max_workers
-        self.my_ip = my_ip          # IP thực của máy — báo cho Tracker để peer khác kết nối đúng chỗ
+        self.my_ip = normalize_ipv6_address(my_ip) if my_ip else ""
+        self.announced_ip = ""
         self.info_hash = piece_manager.metainfo["info_hash"]
 
         self.is_running = False
         self.lock = threading.Lock()
+        self._work_available = threading.Condition(self.lock)
+        self._announce_stop = threading.Event()
+        self._announce_thread: Optional[threading.Thread] = None
+        self._worker_threads: List[threading.Thread] = []
+        self._pending_sockets: set[socket.socket] = set()
 
-        # Quản lý danh sách các peer đã kết nối
+        # Mỗi worker có một socket riêng tới từng peer, tối đa max_workers/socket peer.
         self.connected_peers: Dict[str, Dict] = {}
         self.failed_peers: Dict[str, float] = {}
-
-        # Peer đã chết, chờ được báo cáo lên Tracker ở lần ANNOUNCE tiếp theo
-        self.pending_bad_reports: set = set()
+        self.pending_bad_reports: set[str] = set()
 
         # Đánh dấu các piece đang được tải (tránh 2 luồng tải trùng piece)
         self.in_flight_pieces: set = set()
+
+        # Round-robin counter: tránh nhiều worker pile vào cùng 1 seeder
+        self._peer_rr_index: int = 0
 
         # Đường dẫn file lưu vết tiến độ resume
         self.progress_file = f"{piece_manager.target_file_path}.progress.json"
 
     def start_download(self, peer_node=None) -> bool:
         """Bắt đầu quá trình tải tập tin song song."""
-        self.is_running = True
         self.peer_node = peer_node
         self._load_progress() # Dùng load_progress tránh việc verify lại toàn bộ hash -> Lâu lắc
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
-        # Gửi ANNOUNCE ban đầu lên Tracker
-        self._announce_to_tracker(event="started")
-
-        # Bắt đầu luồng heartbeat announce định kỳ
-        announce_thread = threading.Thread(target=self._periodic_announce, daemon=True)
-        announce_thread.start()
+        self.start_announcing()
 
 
         # Tạo và chạy luồng Worker Pool tải song song
-        worker_threads = []
         for i in range(self.max_workers):
-            t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
+            t = threading.Thread(target=self._worker_loop, args=(i,),
+                                 name=f"piece-worker-{self.peer_id}-{i}", daemon=True)
             t.start()
-            worker_threads.append(t)
+            self._worker_threads.append(t)
 
 
         time_start = time.time()
@@ -103,264 +110,367 @@ class TransferEngine:
         
         return False
 
+    def start_announcing(self) -> None:
+        """Đăng ký file và duy trì heartbeat, kể cả khi đang seeding."""
+        if self.is_running:
+            return
+        if self._announce_stop.is_set():
+            return
+        self.is_running = True
+        peers = self._announce_to_tracker(event="started")
+        if peers:
+            self._update_peer_connections(peers)
+        self._announce_thread = threading.Thread(
+            target=self._periodic_announce,
+            name=f"peer-discovery-{self.peer_id}", daemon=True
+        )
+        self._announce_thread.start()
+
     def _announce_to_tracker(self, event: str = "started") -> List[Dict]:
         """Gửi ANNOUNCE tới Tracker và lấy về danh sách các Peer khả dụng."""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((self.tracker_host, self.tracker_port))
-
             downloaded_bytes = int((self.piece_manager.progress_percentage() / 100.0) * self.piece_manager.file_size)
             left_bytes = self.piece_manager.file_size - downloaded_bytes
-
-            # Lấy danh sách peer chết cần báo cáo và xóa khỏi hàng chờ
             with self.lock:
-                bad_to_report = list(self.pending_bad_reports)
-                self.pending_bad_reports.clear()
+                bad_to_report = list(self.pending_bad_reports)[:256]
 
             msg = create_announce_msg(
                 info_hash=self.info_hash,
                 peer_id=self.peer_id,
                 port=self.listen_port,
-                ip=self.my_ip,          # IP thực để Tracker lưu đúng địa chỉ
+                ip=self.my_ip,          # Rỗng để Tracker dùng IPv6 nguồn của kết nối TCP.
                 event=event,
                 downloaded=downloaded_bytes,
                 left=left_bytes,
-                bad_peers=bad_to_report  # Báo cáo peer chết
+                bad_peers=bad_to_report,
             )
-            if bad_to_report:
-                print(f"[TransferEngine {self.peer_id}] Báo cáo {len(bad_to_report)} peer chết lên Tracker: {bad_to_report}")
-            send_msg(sock, msg)
-            resp = recv_msg(sock)
-            sock.close()
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect((self.tracker_host, self.tracker_port))
+                send_msg(sock, msg)
+                resp = recv_msg(sock)
 
-            # Tiếp theo xin danh sách peers
-            sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock2.settimeout(5.0)
-            sock2.connect((self.tracker_host, self.tracker_port))
-            get_p_msg = create_get_peers_msg(self.info_hash, self.peer_id)
-            send_msg(sock2, get_p_msg)
-            p_resp = recv_msg(sock2)
-            sock2.close()
+            if not isinstance(resp, dict) or resp.get("type") != MessageType.ANNOUNCE_RESPONSE.value:
+                return []
+            if resp.get("status") != "OK":
+                print(f"[TransferEngine {self.peer_id}] Tracker từ chối ANNOUNCE: {resp.get('error', 'không rõ lỗi')}")
+                return []
+            with self.lock:
+                self.pending_bad_reports.difference_update(bad_to_report)
+            reported_ip = resp.get("ip")
+            if reported_ip and reported_ip != self.announced_ip:
+                self.announced_ip = reported_ip
+                print(f"[TransferEngine {self.peer_id}] Tracker đã công bố IPv6 [{reported_ip}]:{self.listen_port}")
 
-            if p_resp and p_resp.get("peers"):
-                return p_resp["peers"]
+            if event == "stopped" or self.piece_manager.is_complete():
+                return []
+
+            return self._get_peers_from_tracker()
+        except (EOFError, OSError, ValueError) as exc:
+            print(f"[TransferEngine {self.peer_id}] Không kết nối được tracker IPv6: {exc}")
             return []
-        except Exception as e:
-            return []
+
+    def _get_peers_from_tracker(self) -> List[Dict]:
+        """Chỉ luồng điều phối hỏi tracker; các worker không gọi tracker."""
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect((self.tracker_host, self.tracker_port))
+                send_msg(sock, create_get_peers_msg(self.info_hash, self.peer_id))
+                response = recv_msg(sock)
+            if isinstance(response, dict) and response.get("type") == MessageType.GET_PEERS_RESPONSE.value:
+                peers = response.get("peers")
+                return peers if isinstance(peers, list) else []
+        except (EOFError, OSError, ValueError) as exc:
+            print(f"[TransferEngine {self.peer_id}] Không lấy được danh sách peer: {exc}")
+        return []
 
     def _periodic_announce(self) -> None:
-        """Gửi ANNOUNCE cập nhật định kỳ 20 giây một lần."""
-        while self.is_running and not self.piece_manager.is_complete():
-            time.sleep(20)
-            peers = self._announce_to_tracker(event="started")
-            if peers:
+        """Một luồng duy trì heartbeat và tìm peer cho toàn bộ worker."""
+        last_announce = time.monotonic()
+        while self.is_running:
+            interval = (self.HEARTBEAT_INTERVAL if self.piece_manager.is_complete()
+                        else min(self.DISCOVERY_INTERVAL, self.HEARTBEAT_INTERVAL))
+            if self._announce_stop.wait(interval):
+                break
+            now = time.monotonic()
+            if self.piece_manager.is_complete() or now - last_announce >= self.HEARTBEAT_INTERVAL:
+                event = "completed" if self.piece_manager.is_complete() else "started"
+                peers = self._announce_to_tracker(event=event)
+                last_announce = now
+            else:
+                peers = self._get_peers_from_tracker()
+            if peers and not self.piece_manager.is_complete():
                 self._update_peer_connections(peers)
 
     def _update_peer_connections(self, peers_list: List[Dict]) -> None:
-        """Khám phá Peer mới từ Tracker và lưu thông tin bitfield."""
+        """Kết nối tới các Peer mới trong danh sách thu thập từ Tracker."""
         for p_info in peers_list:
+            if not isinstance(p_info, dict):
+                continue
             p_id = p_info.get("peer_id")
             ip   = p_info.get("ip")
             port = p_info.get("port")
 
-            if not p_id or not ip or not port:
+            if (not isinstance(p_id, str) or not p_id or not isinstance(ip, str)
+                    or not isinstance(port, int) or isinstance(port, bool)
+                    or not 1 <= port <= 65535):
                 continue
-
-            if p_id in self.failed_peers:
-                if time.time() - self.failed_peers[p_id] < 120: 
-                    continue
+            try:
+                ip = normalize_ipv6_address(ip)
+            except ValueError:
+                continue
 
             # Kiểm tra nhanh trong lock (không làm network ở đây)
             with self.lock:
-                if p_id in self.connected_peers or p_id == self.peer_id:
+                if not self.is_running:
+                    break
+                failed_at = self.failed_peers.get(p_id)
+                if failed_at is not None:
+                    if time.monotonic() - failed_at < self.PEER_RETRY_INTERVAL:
+                        continue
+                    del self.failed_peers[p_id]
+                current = self.connected_peers.get(p_id)
+                if p_id == self.peer_id or (current and (current["ip"], current["port"]) == (ip, port)):
                     continue
 
-            # Kết nối probe NGOÀI lock — chỉ để lấy bitfield
-            sock = self._connect_and_handshake(ip, port)
-            if not sock:
+            # Kết nối thăm dò để lấy BITFIELD, không giữ lock trong lúc chờ mạng.
+            session = self._open_peer_session(ip, port)
+            if not session:
                 continue
+            sock, bitfield = session
 
-            try:
-                bitfield_msg = recv_msg(sock)
-                sock.close()
-                if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
-                    continue
-            except Exception:
-                sock.close()
-                continue
-
-            bitfield = bitfield_msg.get("bitfield", [])
-
-            with self.lock:
-                if p_id not in self.connected_peers:
-                    # Chỉ lưu ip/port/bitfield — không lưu socket (mỗi worker tự kết nối riêng)
+            with self._work_available:
+                previous = self.connected_peers.get(p_id)
+                old_sockets = list(previous["sockets"].values()) if previous else []
+                if previous and previous["spare_socket"] is not None:
+                    old_sockets.append(previous["spare_socket"])
+                if self.is_running:
                     self.connected_peers[p_id] = {
-                        "bitfield":      bitfield,
-                        "ip":            ip,
-                        "port":          port,
-                        "bad_data_count": 0   
+                        "bitfield": bitfield, "ip": ip, "port": port,
+                        "sockets": {}, "spare_socket": sock, "bad_data_count": 0,
                     }
-                    have_count = sum(1 for b in bitfield if b)
-                    print(f"[TransferEngine {self.peer_id}] Biết Peer {p_id} ({ip}:{port}) "
-                          f"| {have_count}/{len(bitfield)} mảnh")
+                    self._work_available.notify_all()
+                else:
+                    old_sockets.append(sock)
+            for old_sock in old_sockets:
+                self._close_socket(old_sock)
+            if self.is_running:
+                print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ([{ip}]:{port})")
 
-    def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
-        """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
+    def _open_peer_session(self, ip: str, port: int) -> Optional[Tuple[socket.socket, List[bool]]]:
+        """Mở một TCP session độc lập và nhận bitfield của peer."""
+        sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             sock.settimeout(5.0)
+            with self.lock:
+                running = self.is_running
+                if running:
+                    self._pending_sockets.add(sock)
+            if not running:
+                sock.close()
+                return None
             sock.connect((ip, port))
-
-            hs_msg = create_handshake_msg(self.info_hash, self.peer_id)
-            send_msg(sock, hs_msg)
-
+            send_msg(sock, create_handshake_msg(self.info_hash, self.peer_id))
             resp = recv_msg(sock)
-            if resp and resp.get("type") == MessageType.HANDSHAKE_RESPONSE.value:
-                if resp.get("info_hash") == self.info_hash:
-                    return sock
-            sock.close()
+            if not isinstance(resp, dict) or resp.get("type") != MessageType.HANDSHAKE_RESPONSE.value or resp.get("info_hash") != self.info_hash:
+                raise ValueError("HANDSHAKE_RESPONSE không hợp lệ")
+            bitfield_msg = recv_msg(sock)
+            if not isinstance(bitfield_msg, dict) or bitfield_msg.get("type") != MessageType.BITFIELD.value:
+                raise ValueError("Thiếu BITFIELD")
+            bitfield = bitfield_msg.get("bitfield")
+            if (not isinstance(bitfield, list) or len(bitfield) != self.piece_manager.num_pieces
+                    or not all(isinstance(value, bool) for value in bitfield)):
+                raise ValueError("BITFIELD không hợp lệ")
+            return sock, bitfield
+        except (EOFError, OSError, ValueError) as exc:
+            if sock is not None:
+                sock.close()
+            if self.is_running:
+                print(f"[TransferEngine {self.peer_id}] Không mở được phiên [{ip}]:{port}: {exc}")
             return None
-        except Exception:
+        finally:
+            if sock is not None:
+                with self.lock:
+                    self._pending_sockets.discard(sock)
+
+    @staticmethod
+    def _close_socket(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+    def _reserve_piece_locked(self) -> Optional[Tuple[int, str, str, int]]:
+        """Chọn peer và giữ chỗ mảnh trong cùng một lần giữ self.lock.
+
+        Dùng round-robin để phân phối đều workers sang các seeder khác nhau,
+        tránh tình huống nhiều worker cùng pile vào 1 seeder khi có nhiều seeder.
+        """
+        peer_bitfields = {peer_id: info["bitfield"] for peer_id, info in self.connected_peers.items()}
+        missing = [piece for piece in self.piece_manager.missing_pieces()
+                   if piece not in self.in_flight_pieces]
+        piece_index = choose_next_piece(missing, peer_bitfields, strategy="rarest_first")
+        if piece_index is None:
             return None
+        owners = [(peer_id, info) for peer_id, info in self.connected_peers.items()
+                  if info["bitfield"][piece_index]]
+        if not owners:
+            return None
+        # Round-robin: ưu tiên seeder theo thứ tự vòng tròn thay vì random
+        # Giúp phân tải đều khi có nhiều seeder cùng bitfield
+        pick_idx = self._peer_rr_index % len(owners)
+        self._peer_rr_index += 1
+        peer_id, info = owners[pick_idx]
+        self.in_flight_pieces.add(piece_index)
+        return piece_index, peer_id, info["ip"], info["port"]
 
     def _worker_loop(self, worker_id: int) -> None:
-        """Vòng lặp của Worker Thread. Mỗi worker có bộ connection riêng — không tranh socket với nhau."""
-        # Dict connection riêng của worker này: { peer_id: socket }
-        my_conns: Dict[str, socket.socket] = {}
+        """Mỗi worker dùng socket riêng và không tự hỏi tracker."""
+        try:
+            while self.is_running and not self.piece_manager.is_complete():
+                with self._work_available:
+                    reservation = self._reserve_piece_locked()
+                    if reservation is None:
+                        self._work_available.wait(timeout=0.5)
+                        continue
+                piece_index, peer_id, ip, port = reservation
+                try:
+                    success = self._download_piece_from_peer(piece_index, peer_id, ip, port, worker_id)
+                finally:
+                    with self._work_available:
+                        self.in_flight_pieces.discard(piece_index)
+                        self._work_available.notify_all()
+                if not success:
+                    self._announce_stop.wait(0.5)
+        finally:
+            self._close_worker_sockets(worker_id)
 
-        while self.is_running and not self.piece_manager.is_complete():
-            with self.lock:
-                peer_bitfields = {p_id: info["bitfield"] for p_id, info in self.connected_peers.items()}
-                missing = [p for p in self.piece_manager.missing_pieces() if p not in self.in_flight_pieces]
-
-            if not missing or not peer_bitfields:
-                peers = self._announce_to_tracker()
-                if peers:
-                    self._update_peer_connections(peers)
-                time.sleep(2.0)
-                continue
-
-            target_piece = choose_next_piece(missing, peer_bitfields, strategy="rarest_first")
-            if target_piece is None:
-                time.sleep(0.5)
-                continue
-
-            # Claim piece — check + add trong cùng 1 lock
-            with self.lock:
-                if target_piece in self.in_flight_pieces:
-                    continue
-                self.in_flight_pieces.add(target_piece)
-
-            # Tải mảnh bằng connection riêng của worker này
-            success = self._download_piece(target_piece, my_conns)
-
-            with self.lock:
-                self.in_flight_pieces.discard(target_piece)
-
-            if not success:
-                time.sleep(0.5)
-
-        # Dọn dẹp connection khi worker thoát
-        for sock in my_conns.values():
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-    def _download_piece(self, piece_index: int, my_conns: Dict[str, "socket.socket"]) -> bool:
-        """
-        Tải 1 mảnh từ Peer bất kỳ sử dụng connection riêng của worker (độc lập, không bị block).
-        my_conns: dict local của worker { peer_id: socket } — không dùng chung với worker khác.
-        """
+    def _worker_socket(self, worker_id: int, peer_id: str, ip: str,
+                       port: int) -> Optional[socket.socket]:
         with self.lock:
-            available_peers = [
-                (p_id, info) for p_id, info in self.connected_peers.items()
-                if piece_index < len(info["bitfield"]) and info["bitfield"][piece_index]
-            ]
+            peer = self.connected_peers.get(peer_id)
+            if not peer or (peer["ip"], peer["port"]) != (ip, port):
+                return None
+            sock = peer["sockets"].get(worker_id)
+            if sock is not None:
+                return sock
+            spare = peer["spare_socket"]
+            if spare is not None:
+                peer["spare_socket"] = None
+                peer["sockets"][worker_id] = spare
+                return spare
 
-        if not available_peers:
-            return False
+        session = self._open_peer_session(ip, port)
+        if not session:
+            if self.is_running:
+                self._disconnect_peer(peer_id, endpoint=(ip, port))
+            return None
+        sock, bitfield = session
+        with self._work_available:
+            peer = self.connected_peers.get(peer_id)
+            if self.is_running and peer and (peer["ip"], peer["port"]) == (ip, port):
+                peer["sockets"][worker_id] = sock
+                peer["bitfield"] = bitfield
+                self._work_available.notify_all()
+                return sock
+        self._close_socket(sock)
+        return None
 
-        p_id, p_info = random.choice(available_peers)
-        ip   = p_info["ip"]
-        port = p_info["port"]
+    def _discard_worker_socket(self, worker_id: int, peer_id: str,
+                               sock: socket.socket) -> None:
+        with self.lock:
+            peer = self.connected_peers.get(peer_id)
+            if peer and peer["sockets"].get(worker_id) is sock:
+                del peer["sockets"][worker_id]
+        self._close_socket(sock)
 
-        # Lấy hoặc tạo connection riêng của worker này tới peer này
-        sock = my_conns.get(p_id)
+    def _close_worker_sockets(self, worker_id: int) -> None:
+        with self.lock:
+            sockets = [peer["sockets"].pop(worker_id) for peer in self.connected_peers.values()
+                       if worker_id in peer["sockets"]]
+        for sock in sockets:
+            self._close_socket(sock)
+
+    def _disconnect_peer(self, peer_id: str, sock=None, endpoint=None) -> None:
+        """Quarantine the current peer and close all of its worker sessions."""
+        with self._work_available:
+            peer = self.connected_peers.get(peer_id)
+            if peer is None:
+                return
+            if endpoint is not None and (peer["ip"], peer["port"]) != endpoint:
+                return
+            sockets = list(peer["sockets"].values())
+            if peer["spare_socket"] is not None:
+                sockets.append(peer["spare_socket"])
+            if sock is not None and sock not in sockets:
+                return  # A stale session must not remove a new registration.
+            del self.connected_peers[peer_id]
+            self.failed_peers[peer_id] = time.monotonic()
+            self.pending_bad_reports.add(peer_id)
+            self._work_available.notify_all()
+        for session in sockets:
+            self._close_socket(session)
+        print(f"[TransferEngine {self.peer_id}] Tạm ngắt peer {peer_id}; chờ báo cáo lên tracker")
+
+    def _record_bad_data(self, peer_id: str, sock, worker_id: int) -> None:
+        with self.lock:
+            peer = self.connected_peers.get(peer_id)
+            if peer is None or sock not in peer["sockets"].values():
+                return
+            peer["bad_data_count"] += 1
+            strikes = peer["bad_data_count"]
+        print(f"[TransferEngine {self.peer_id}] Peer {peer_id} gửi dữ liệu lỗi ({strikes}/{self.MAX_BAD_DATA})")
+        if strikes >= self.MAX_BAD_DATA:
+            self._disconnect_peer(peer_id, sock)
+        else:
+            self._discard_worker_socket(worker_id, peer_id, sock)
+
+    def _download_piece_from_peer(self, piece_index: int, peer_id: str, ip: str,
+                                  port: int, worker_id: int) -> bool:
+        sock = self._worker_socket(worker_id, peer_id, ip, port)
         if sock is None:
-            sock = self._connect_and_handshake(ip, port)
-            if not sock:
-                return False
-            recv_msg(sock)   # Tiêu thụ BITFIELD mà Seeder gửi ngay sau handshake
-            my_conns[p_id] = sock
-        sock_lock = threading.Thread.Lock()  # Lock riêng cho socket này để tránh 2 workers cùng dùng socket
-        acquired = sock_lock.acquire(timeout=10.0)
-        if not acquired:
             return False
         try:
-            # Giai đoạn 1: Gửi yêu cầu
-            req_msg = create_request_msg(piece_index)
             sock.settimeout(15.0)
+            send_msg(sock, create_request_msg(piece_index))
+            resp = recv_msg(sock)
+            if not isinstance(resp, dict) or resp.get("type") != MessageType.PIECE.value:
+                raise ValueError("Thiếu hoặc sai phản hồi PIECE")
             try:
-                send_msg(sock, req_msg)
-            except OSError:
-                self._disconnect_peer(p_id, sock)
-                return False
-
-            # Giai đoạn 2: Nhận phản hồi
-            try:
-                resp = recv_msg(sock)
-            except (EOFError, socket.timeout, OSError):
-                self._disconnect_peer(p_id, sock)
-                return False
-            except Exception:
-                return False
-
-            # Giai đoạn 3: Kiểm tra phản hồi
-            if resp.get("type") != MessageType.PIECE.value:
-                self._record_bad_data(p_id, sock)
-                return False
-
-            if resp.get("piece_index") != piece_index:
-                self._record_bad_data(p_id, sock)
-                return False
-
-            # Giai đoạn 4: Kiểm tra dữ liệu Base64
-            raw_b64 = resp.get("data")
-
-            if not isinstance(raw_b64, str):
-                self._record_bad_data(p_id, sock)
-                return False
-
-            piece_data = base64.b64decode(raw_b64)
-
-            # Giai đoạn 5: Ghi mảnh
+                recv_idx, piece_data = recv_piece_data(sock, resp)
+            except Exception as exc:
+                raise ValueError(f"Lỗi đọc dữ liệu piece: {exc}") from exc
+            if recv_idx != piece_index:
+                raise ValueError(f"piece_index không khớp: nhận {recv_idx}, mong {piece_index}")
             try:
                 written = self.piece_manager.write_piece(piece_index, piece_data)
-            except OSError as e:
-                print(f"Lỗi ghi piece {piece_index}: {e}")
+            except OSError as exc:
+                print(f"[TransferEngine {self.peer_id}] Lỗi ghi mảnh {piece_index}: {exc}")
                 return False
-
             if not written:
-                # SHA-256 không khớp → peer gửi dữ liệu hỏng, ghi nhận lỗi
-                self._record_bad_data(p_id, sock)
-                return False
-
-            print(
-                f"[TransferEngine {self.peer_id}] "
-                f"Piece {piece_index} ✓ từ Peer {p_id} "
-                f"({self.piece_manager.progress_percentage():.1f}%)"
-            )
+                pm = self.piece_manager
+                length = min(pm.piece_length, pm.file_size - piece_index * pm.piece_length)
+                if (len(piece_data) != length
+                        or hashlib.sha256(piece_data).hexdigest() != pm.expected_hashes[piece_index]):
+                    raise ValueError("Mảnh sai độ dài hoặc SHA-256")
+                print(f"[TransferEngine {self.peer_id}] Không ghi được mảnh {piece_index} xuống đĩa")
+                return False  # Local storage errors must not penalize the remote peer.
+            print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ từ Peer {peer_id} ({self.piece_manager.progress_percentage():.1f}%)")
             if self.peer_node:
                 self.peer_node.broadcast_have(piece_index)
-
             return True
-
-        finally:
-            # Luôn release lock dù thành công hay thất bại
-            if acquired:
-                sock_lock.release()
+        except (EOFError, OSError) as exc:
+            print(f"[TransferEngine {self.peer_id}] Mất kết nối tải mảnh {piece_index} từ {peer_id}: {exc}")
+            if self.is_running:
+                self._disconnect_peer(peer_id, sock)
+            return False
+        except (ValueError, TypeError) as exc:
+            print(f"[TransferEngine {self.peer_id}] Lỗi mảnh {piece_index} từ {peer_id}: {exc}")
+            self._record_bad_data(peer_id, sock, worker_id)
+            return False
 
     def _save_progress(self) -> None:
         """Lưu tiến độ tải (.progress.json) hỗ trợ Resume download."""
@@ -425,59 +535,22 @@ class TransferEngine:
 
 
     def stop(self) -> None:
-
         self.is_running = False
-        with self.lock:
-            for p_info in self.connected_peers.values():
-                try:
-                    p_info["sock"].close()
-                except Exception:
-                    pass
+        self._announce_stop.set()
+        with self._work_available:
+            sockets = [sock for peer in self.connected_peers.values()
+                       for sock in peer["sockets"].values()]
+            sockets.extend(peer["spare_socket"] for peer in self.connected_peers.values()
+                           if peer["spare_socket"] is not None)
+            sockets.extend(self._pending_sockets)
+            self._pending_sockets.clear()
             self.connected_peers.clear()
-
-    def _record_bad_data(self, p_id: str, sock, max_strikes: int = 4) -> None:
-        """
-        Ghi nhận 1 lần peer gửi sai dữ liệu (sai type, sai piece_index, sai Base64, SHA-256 fail...).
-        Khi đạt ngưỡng max_strikes thì tự động ngắt kết nối peer đó.
-        """
-        with self.lock:
-            info = self.connected_peers.get(p_id)
-            if info is None or info.get("sock") is not sock:
-                return  # Peer đã bị xóa trước đó
-
-            info["bad_data_count"] += 1
-            count = info["bad_data_count"]
-
-        if count >= max_strikes:
-            print(
-                f"[TransferEngine {self.peer_id}] Peer {p_id} gửi sai dữ liệu "
-                f"{count} lần (ngưỡng {max_strikes}) → Ngắt kết nối."
-            )
-            self._disconnect_peer(p_id, sock)
-        else:
-            print(
-                f"[TransferEngine {self.peer_id}] Peer {p_id} gửi sai dữ liệu "
-                f"(lần {count}/{max_strikes})."
-            )
-
-    def _disconnect_peer(self, p_id, sock):
-        """Chỉ ngắt kết nối nếu peer vẫn đang dùng đúng socket này.
-        Đồng thời ghi nhận peer này vào hàng chờ báo cáo lên Tracker.
-        """
-        with self.lock:
-            current = self.connected_peers.get(p_id)
-
-            if current is None or current.get("sock") is not sock:
-                return
-
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-            del self.connected_peers[p_id]
-
-            # Ghi vào failed_peers (blacklist tạm) và hàng chờ báo cáo Tracker
-            self.failed_peers[p_id] = time.time()
-            self.pending_bad_reports.add(p_id)
-            self.failed_peers[p_id] = time.time()
+            self._work_available.notify_all()
+        for sock in sockets:
+            self._close_socket(sock)
+        if self._announce_thread and self._announce_thread is not threading.current_thread():
+            self._announce_thread.join(timeout=6.0)
+        deadline = time.monotonic() + 6.0
+        for worker in self._worker_threads:
+            if worker is not threading.current_thread():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))

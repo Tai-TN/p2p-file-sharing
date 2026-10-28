@@ -42,7 +42,7 @@ class TrackerState:
                 "left": left,
                 "last_seen": time.time()
             }
-            print(f"[Tracker State] Cập nhật Peer {peer_id} ({ip}:{port}) cho file {info_hash[:8]}... (event={event})")
+            print(f"[Tracker State] Cập nhật Peer {peer_id} ([{ip}]:{port}) cho file {info_hash[:8]}... (event={event})")
             return True
 
     def get_peers(self, info_hash: str, exclude_peer_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -78,14 +78,15 @@ class TrackerState:
         """
         removed = []
         with self.lock:
+            swarm = self.swarms.get(info_hash, {})
+            if reporter_id not in swarm:
+                return removed
             if info_hash not in self._bad_reports:
                 self._bad_reports[info_hash] = {}
 
             reports = self._bad_reports[info_hash]
-            swarm = self.swarms.get(info_hash, {})
-
             for bad_id in bad_peer_ids:
-                if bad_id == reporter_id:
+                if bad_id == reporter_id or bad_id not in swarm:
                     continue  # Không tự tố cáo chính mình
 
                 if bad_id not in reports:
@@ -113,11 +114,13 @@ class TrackerState:
                     if now - swarm[peer_id]["last_seen"] > self.peer_timeout:
                         print(f"[Tracker Cleanup] Loại bỏ peer chết: {peer_id} khỏi swarm {info_hash[:8]}...")
                         del swarm[peer_id]
+                        self._bad_reports.get(info_hash, {}).pop(peer_id, None)
                         removed_count += 1
 
                 # Nếu swarm không còn peer nào thì dọn dẹp swarm
                 if not swarm:
                     del self.swarms[info_hash]
+                    self._bad_reports.pop(info_hash, None)
 
             return removed_count
 

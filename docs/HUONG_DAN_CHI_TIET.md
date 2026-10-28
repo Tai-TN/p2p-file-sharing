@@ -2,6 +2,8 @@
 
 Tài liệu này giải thích chi tiết kiến trúc hệ thống, danh sách tất cả các hàm đã code, tham số đầu vào, kết quả đầu ra, luồng chạy thực tế và logic chi tiết từng dòng code của dự án chia sẻ file ngang hàng (P2P File Sharing).
 
+> Nhánh `feature/direct-ipv6` chỉ dùng TCP IPv6. Tracker và `PeerNode` lắng nghe trên `::`; client mặc định để tracker lấy IPv6 nguồn từ `ANNOUNCE`. Xem [hướng dẫn thử Internet](KE_HOACH_P2P_INTERNET.md) để chạy trên Fedora và Android. Phần mô tả hàm bên dưới là tổng quan kiến trúc; đối chiếu với source hiện tại khi cần chi tiết triển khai.
+
 ---
 
 ## TỔNG QUAN KIẾN TRÚC MẠNG P2P
@@ -29,9 +31,13 @@ File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-shari
 
 ### 1.1. Các hàm xử lý Socket Framing
 
-- **`recv_exact(sock, num_bytes) -> Optional[bytes]`**: Đọc đúng và đủ `num_bytes` từ socket TCP để giải quyết triệt để vấn đề xé gói (Fragmentation).
+- **`recv_exact(sock, num_bytes) -> bytes`**: Đọc đúng và đủ `num_bytes` từ socket TCP để giải quyết triệt để vấn đề xé gói (Fragmentation).
 - **`send_msg(sock, payload: dict) -> bool`**: Đóng gói Dictionary JSON với **4-byte length prefix** (Big-Endian) trước khi gửi qua TCP socket.
-- **`recv_msg(sock) -> Optional[dict]`**: Đọc 4 byte tiêu đề $\rightarrow$ giải mã lấy độ dài $L$ $\rightarrow$ đọc tiếp đúng $L$ bytes nội dung $\rightarrow$ `json.loads()`.
+- **`recv_msg(sock) -> dict`**: Đọc 4 byte tiêu đề $\rightarrow$ giải mã lấy độ dài $L$ $\rightarrow$ đọc tiếp đúng $L$ bytes nội dung $\rightarrow$ `json.loads()`.
+
+Sau khi ghép `main` vào nhánh IPv6, `recv_msg()` trả `dict` khi thành công và **ném exception khi lỗi**, theo cách báo lỗi của `main`: `EOFError` nếu socket đóng giữa header/body; `OSError` hoặc `socket.timeout` nếu lỗi mạng; `ProtocolError` (kế thừa `ValueError`) nếu độ dài frame, UTF-8, JSON hoặc kiểu thông điệp không hợp lệ. `send_msg()` trả `True` khi thành công và để lỗi truyền ra bên gọi. Frame được giới hạn 64 MiB trước khi đọc body; giao thức length-prefix và dữ liệu Base64 giữ nguyên.
+
+Engine bắt các lỗi này tại bước tracker, handshake và tải mảnh. Mất kết nối loại peer hiện tại khỏi danh sách đang tải, đóng các socket thuộc peer đó và tạm tránh trong 120 giây. Dữ liệu sai được đếm chung giữa các worker; sau 4 lần lỗi, peer cũng bị tạm loại. Báo cáo `bad_peers` chỉ được gỡ khỏi hàng chờ sau khi tracker xác nhận ANNOUNCE; tracker cần báo cáo từ 2 peer khác nhau để xóa peer bị báo cáo khỏi swarm. Lỗi ghi dữ liệu hợp lệ trên máy nhận không được tính thành lỗi của seeder.
 
 ### 1.2. Danh sách Message Builders
 
@@ -49,10 +55,10 @@ File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-shari
 ### 2.2. Module PieceManager (`storage/piece_manager.py`)
 
 - **`PieceManager.__init__()`**: Khởi tạo mảng `bitfield = [False] * num_pieces` và đối tượng khóa đa luồng `self.file_lock = threading.Lock()`.
-- **`_initialize_storage()`**: Tạo file trống và tiền phân bổ dung lượng (`truncate`), quét và xác minh các mảnh hiện có.
+- **`_initialize_storage()`**: Tạo file trống và tiền phân bổ dung lượng (`truncate`); việc quét và xác minh mảnh đã có do `verify_all_pieces()` thực hiện khi được gọi.
 - **`_get_piece_bounds(piece_index)`**: Tính vị trí byte `offset = piece_index * piece_length` trên đĩa.
 - **`read_piece(piece_index)`**: Kiểm tra mảnh đã có chưa, sau đó đọc dữ liệu từ đĩa bọc trong `with self.file_lock:`.
-- **`write_piece(piece_index, data)`**: Kiểm tra checksum SHA-256 trước. Nếu hợp lệ, ghi xuống đĩa bằng `seek(offset)` và `os.fsync()`, cập nhật `bitfield[piece_index] = True`.
+- **`write_piece(piece_index, data)`**: Kiểm tra độ dài và checksum SHA-256 trước. Nếu hợp lệ, ghi xuống đĩa bằng `seek(offset)` và `flush()`, cập nhật `bitfield[piece_index] = True`.
 
 ---
 
@@ -61,7 +67,7 @@ File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-shari
 ### 3.1. Class `TrackerState` (`tracker/state.py`)
 
 - **`register_peer(...)`**: Đăng ký hoặc cập nhật thời gian `last_seen` của Peer trong cấu trúc Swarm `swarms[info_hash]`. Nếu `event == "stopped"`, xóa Peer ra khỏi Swarm.
-- **`get_peers(...)`**: Trả về danh sách địa chỉ `IP:Port` của các Peer đang chia sẻ file, tự động loại trừ chính nút gửi yêu cầu (`exclude_peer_id`).
+- **`get_peers(...)`**: Trả về danh sách địa chỉ IPv6 và cổng của các Peer đang chia sẻ file, tự động loại trừ chính nút gửi yêu cầu (`exclude_peer_id`).
 - **`cleanup_stale_peers()`**: Quét dọn các Peer "chết" quá thời hạn timeout (60 giây).
 
 ### 3.2. Class `TrackerServer` (`tracker/tracker_server.py`)
@@ -150,7 +156,7 @@ File: [peer/transfer_engine.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-sh
 - Mở tiếp kết nối gửi `GET_PEERS` để lấy về danh sách các máy `[{"peer_id": ..., "ip": ..., "port": ...}]`.
 
 #### 🔹 `_periodic_announce()`
-- Vòng lặp vô tận ngủ 20 giây một lần (`time.sleep(20)`), gọi `_announce_to_tracker()` và cập nhật danh sách các máy mới qua `_update_peer_connections()`.
+- Một thread điều phối hỏi `GET_PEERS` khoảng 2 giây/lần khi đang tải và gửi heartbeat `ANNOUNCE` khoảng 20 giây/lần; seeder đã hoàn tất tiếp tục heartbeat để không hết hạn trên tracker.
 
 #### 🔹 `_update_peer_connections(peers_list)`
 - Duyệt qua danh sách máy nhận từ Tracker. Mở kết nối socket TCP tới các máy mới chưa có trong `connected_peers`, gửi `HANDSHAKE` và nhận tin nhắn `BITFIELD` để cập nhật vào `connected_peers[p_id]`.
@@ -160,11 +166,11 @@ File: [peer/transfer_engine.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-sh
   1. Lấy danh sách các mảnh còn thiếu `missing` (loại bỏ các mảnh đang được luồng khác tải trong `in_flight_pieces`).
   2. Gọi `choose_next_piece()` theo thuật toán **Rarest-First** để chọn chỉ số mảnh `target_piece` tốt nhất.
   3. Thêm `target_piece` vào `in_flight_pieces` để các luồng khác không tải trùng.
-  4. Gọi `_download_piece_from_any_peer(target_piece)` để xin dữ liệu mảnh.
+  4. Gọi `_download_piece_from_peer(...)` qua socket riêng của worker để xin dữ liệu mảnh.
   5. Xóa `target_piece` khỏi `in_flight_pieces`.
 
-#### 🔹 `_download_piece_from_any_peer(piece_index) -> bool`
-- Tìm trong `connected_peers` danh sách các máy sở hữu mảnh `piece_index`.
+#### 🔹 `_download_piece_from_peer(piece_index, peer_id, ip, port, worker_id) -> bool`
+- Dùng peer đã được chọn khi giữ chỗ mảnh dưới lock.
 - Gửi tin nhắn `REQUEST(piece_index)` qua TCP socket tới máy đó.
 - Nhận thông điệp `PIECE`, giải mã Base64 dữ liệu.
 - Gọi `piece_manager.write_piece(piece_index, data)` để ghi đĩa và kiểm tra checksum SHA-256.
@@ -193,7 +199,7 @@ sequenceDiagram
     Engine->>Tracker: ANNOUNCE (event="started", port=7002)
     Tracker-->>Engine: ANNOUNCE_RESPONSE (status="OK")
     Engine->>Tracker: GET_PEERS (info_hash)
-    Tracker-->>Engine: GET_PEERS_RESPONSE ([Peer A: 127.0.0.1:7001])
+    Tracker-->>Engine: GET_PEERS_RESPONSE ([Peer A: [::1]:7001])
     
     Engine->>PeerA: TCP Connect & HANDSHAKE (info_hash)
     PeerA-->>Engine: HANDSHAKE_RESPONSE & BITFIELD ([True, True, True])
