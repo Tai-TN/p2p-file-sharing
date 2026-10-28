@@ -17,6 +17,11 @@ from protocol.messages import (
     create_request_msg
 )
 from .selection import choose_next_piece
+<<<<<<< Updated upstream
+=======
+from .connection import PeerConnection
+from .peer_selector import PeerSelector
+>>>>>>> Stashed changes
 
 class TransferEngine:
     """
@@ -25,7 +30,8 @@ class TransferEngine:
     """
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
-                 max_workers: int = 4, my_ip: str = ""):
+                 max_workers: int = 4, my_ip: str = "",
+                 strategy: str = "rarest_first"):
         self.peer_id = peer_id
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
@@ -33,6 +39,8 @@ class TransferEngine:
         self.piece_manager = piece_manager
         self.max_workers = max_workers
         self.my_ip = my_ip          # IP thực của máy — báo cho Tracker để peer khác kết nối đúng chỗ
+        # Chiến lược chọn mảnh: "rarest_first" (mặc định), "random" hoặc "sequential".
+        self.strategy = strategy
         self.info_hash = piece_manager.metainfo["info_hash"]
 
         self.is_running = False
@@ -40,6 +48,8 @@ class TransferEngine:
 
         # Quản lý danh sách các peer đã kết nối
         self.connected_peers: Dict[str, Dict] = {}
+        # Một selector dùng chung cho mọi worker để đếm tải theo từng peer.
+        self.peer_selector = PeerSelector()
 
         # Đánh dấu các piece đang được tải (tránh 2 luồng tải trùng piece)
         self.in_flight_pieces: set = set()
@@ -55,8 +65,17 @@ class TransferEngine:
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
+<<<<<<< Updated upstream
         # Gửi ANNOUNCE ban đầu lên Tracker
         self._announce_to_tracker(event="started")
+=======
+        # Đăng ký bản thân với Tracker và lấy danh sách Peer hiện có.
+        # Dùng luôn danh sách trả về; trước đây bị bỏ đi nên worker phải chờ 2s
+        # rồi mới hỏi lại Tracker.
+        peers = self._announce_to_tracker(event="started")
+        if peers:
+            self._update_peer_connections(peers)
+>>>>>>> Stashed changes
 
         # Bắt đầu luồng heartbeat announce định kỳ
         announce_thread = threading.Thread(target=self._periodic_announce, daemon=True)
@@ -96,7 +115,7 @@ class TransferEngine:
             self._announce_to_tracker(event="completed")
             self._remove_progress_file()
             return True
-        
+
         return False
 
     def _announce_to_tracker(self, event: str = "started") -> List[Dict]:
@@ -221,16 +240,44 @@ class TransferEngine:
                 time.sleep(2.0)
                 continue
 
+<<<<<<< Updated upstream
             target_piece = choose_next_piece(missing, peer_bitfields, strategy="rarest_first")
+=======
+            if not missing:
+                # Tất cả mảnh còn thiếu đang được các worker khác tải (in-flight)
+                time.sleep(0.2)
+                continue
+
+            # Chỉ chọn mảnh mà ít nhất một peer ĐANG DÙNG ĐƯỢC có giữ. Nếu không,
+            # mảnh chỉ nằm ở peer đã rời mạng / đang bị backoff sẽ bị chọn lại liên
+            # tục và chặn các mảnh khác (head-of-line blocking, rõ nhất với Sequential).
+            # Độ hiếm vẫn đếm trên mọi peer đã biết.
+            usable = self.peer_selector.available_peers(list(peer_bitfields))
+            missing = [
+                p for p in missing
+                if any(p < len(peer_bitfields[q]) and peer_bitfields[q][p] for q in usable)
+            ]
+            target_piece = choose_next_piece(missing, peer_bitfields, strategy=self.strategy)
+>>>>>>> Stashed changes
             if target_piece is None:
                 time.sleep(0.5)
                 continue
 
             # Claim piece — check + add trong cùng 1 lock
             with self.lock:
+<<<<<<< Updated upstream
                 if target_piece in self.in_flight_pieces:
                     continue
                 self.in_flight_pieces.add(target_piece)
+=======
+                already_taken = target_piece in self.in_flight_pieces
+                if not already_taken:
+                    self.in_flight_pieces.add(target_piece)
+            if already_taken:
+                # Ngủ NGOÀI lock (trước đây ngủ trong lock, chặn các worker khác).
+                time.sleep(0.05)
+                continue
+>>>>>>> Stashed changes
 
             # Tải mảnh bằng connection riêng của worker này
             success = self._download_piece(target_piece, my_conns)
@@ -239,7 +286,9 @@ class TransferEngine:
                 self.in_flight_pieces.discard(target_piece)
 
             if not success:
-                time.sleep(0.5)
+                # Nghỉ ngắn. Peer lỗi/CHOKE đã bị PeerSelector tạm loại bằng
+                # cooldown/backoff, nên không cần chặn cả worker 0.5s ở đây.
+                time.sleep(0.05)
 
         # Dọn dẹp connection khi worker thoát
         for sock in my_conns.values():
@@ -262,10 +311,16 @@ class TransferEngine:
         if not available_peers:
             return False
 
-        p_id, p_info = random.choice(available_peers)
+        # Selector chọn trong các peer có piece này và reserve một request.
+        piece_size = self._piece_size(piece_index)
+        selected = self.peer_selector.select_peer(available_peers, piece_size)
+        if selected is None:
+            return False
+        p_id, p_info = selected
         ip   = p_info["ip"]
         port = p_info["port"]
 
+<<<<<<< Updated upstream
         # Lấy hoặc tạo connection riêng của worker này tới peer này
         sock = my_conns.get(p_id)
         if sock is None:
@@ -274,25 +329,81 @@ class TransferEngine:
                 return False
             recv_msg(sock)   # Tiêu thụ BITFIELD mà Seeder gửi ngay sau handshake
             my_conns[p_id] = sock
+=======
+        # Tái sử dụng connection của worker; nếu chưa có thì handshake và báo interested.
+        connection = my_conns.get(p_id)
+        if connection is None:
+            connection = self._create_connection(p_id, ip, port)
+            if connection is None:
+                # Đã reserve nhưng không tạo được connection nên phải release.
+                self.peer_selector.record_failure(p_id)
+                return False
+            if not connection.send_interested():
+                connection.close()
+                # Gửi INTERESTED thất bại cũng được tính là request lỗi.
+                self.peer_selector.record_failure(p_id)
+                return False
+            # INTERESTED là tín hiệu cho server biết worker đang cần piece.
+            my_conns[p_id] = connection
+            with self.lock:
+                self._worker_connections.add(connection)
+>>>>>>> Stashed changes
 
+        request_settled = False
         try:
             req_msg = create_request_msg(piece_index)
             sock.settimeout(30.0)
 
+<<<<<<< Updated upstream
             if not send_msg(sock, req_msg):
                 raise ConnectionError("Gửi REQUEST thất bại")
+=======
+            # PeerConnection tự gửi REQUEST, xử lý các message trung gian và trả về
+            # PIECE hoặc CHOKE cho TransferEngine.
+            # Chỉ đo thời gian truyền request, không tính thời gian handshake.
+            # perf_counter() có độ phân giải micro giây trên mọi hệ điều hành.
+            # time.monotonic() trên Windows (Python <= 3.12) chỉ chính xác ~15,6 ms:
+            # mảnh tải nhanh trên localhost sẽ đo ra 0 giây, record_success() báo lỗi
+            # và lần tải THÀNH CÔNG bị tính là peer lỗi (bị phạt, backoff, đóng socket).
+            request_started = time.perf_counter()
+            resp = connection.request_piece(piece_index)
+            # Chặn dưới 1 micro giây để không bao giờ chia cho 0.
+            request_elapsed = max(time.perf_counter() - request_started, 1e-6)
+            if not resp:
+                raise ConnectionError("Peer đóng connection khi đang chờ message")
+            if resp.get("type") == MessageType.CHOKE.value:
+                # CHOKE là trạng thái tạm thời, không phải lỗi kết nối.
+                self.peer_selector.record_choke(p_id)
+                request_settled = True
+                return False
+>>>>>>> Stashed changes
 
             resp = recv_msg(sock)
             if resp and resp.get("type") == MessageType.PIECE.value:
                 if resp.get("piece_index") == piece_index:
                     piece_data = base64.b64decode(resp["data"])
                     if self.piece_manager.write_piece(piece_index, piece_data):
+<<<<<<< Updated upstream
+=======
+                        # Chỉ cập nhật tốc độ sau khi dữ liệu đã ghi và xác minh thành công.
+                        self.peer_selector.record_success(
+                            p_id,
+                            len(piece_data),
+                            request_elapsed,
+                        )
+                        request_settled = True
+                        # Chỉ ghi nhận đóng góp sau khi checksum và ghi đĩa thành công.
+                        # PeerNode dùng số liệu này để xếp hạng regular unchoking.
+                        if self.peer_node:
+                            self.peer_node.record_download(p_id, len(piece_data))
+>>>>>>> Stashed changes
                         print(f"[Worker-{self.peer_id}] Piece {piece_index} ✓ ← {p_id} "
                               f"({self.piece_manager.progress_percentage():.1f}%)")
                         if self.peer_node:
                             self.peer_node.broadcast_have(piece_index)
                         return True
 
+<<<<<<< Updated upstream
         except Exception:
             # Connection bị đứt — xóa khỏi my_conns để worker sẽ tạo lại lần sau
             try:
@@ -303,8 +414,31 @@ class TransferEngine:
             with self.lock:
                 if p_id in self.connected_peers:
                     del self.connected_peers[p_id]
+=======
+            self.peer_selector.record_failure(p_id)
+            request_settled = True
+        except Exception as e:
+            if not request_settled:
+                # Mọi lỗi bất ngờ phải release pending đúng một lần.
+                self.peer_selector.record_failure(p_id)
+            # Connection lỗi hoặc timeout: đóng kết nối hiện tại của worker này để lần sau tạo lại socket mới
+            connection = my_conns.pop(p_id, None)
+            if connection is not None:
+                connection.close()
+                with self.lock:
+                    self._worker_connections.discard(connection)
+>>>>>>> Stashed changes
 
         return False
+
+    def _piece_size(self, piece_index: int) -> int:
+        """Trả về kích thước thực tế của piece, kể cả piece cuối."""
+        if piece_index == self.piece_manager.num_pieces - 1:
+            # Piece cuối có thể nhỏ hơn piece_length chuẩn.
+            return self.piece_manager.file_size - (
+                piece_index * self.piece_manager.piece_length
+            )
+        return self.piece_manager.piece_length
 
     def _save_progress(self) -> None:
         """Lưu tiến độ tải (.progress.json) hỗ trợ Resume download."""

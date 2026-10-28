@@ -1,5 +1,6 @@
 import socket
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 from storage.piece_manager import PieceManager
@@ -23,7 +24,16 @@ class PeerNode:
     """
 
     def __init__(self, peer_id: str, host: str, port: int,
+<<<<<<< Updated upstream
                  piece_manager: Optional[PieceManager] = None):
+=======
+                 piece_manager: Optional[PieceManager] = None,
+                 regular_slots: int = 2,
+                 optimistic_slots: int = 1,
+                 choking_interval: float = 20.0,
+                 measurement_window: float = 30.0,
+                 upload_rate_limit: Optional[float] = None):
+>>>>>>> Stashed changes
         self.peer_id = peer_id
         self.host = host
         self.port = port
@@ -37,6 +47,12 @@ class PeerNode:
         if piece_manager is not None:
             info_hash = piece_manager.metainfo["info_hash"]
             self._piece_managers[info_hash] = piece_manager
+
+        # Giới hạn tốc độ upload (byte/giây) để giả lập mạng thật khi thí nghiệm.
+        # None = không giới hạn. Mọi kết nối dùng chung một "đường truyền", nên
+        # gửi tuần tự qua _upload_lock (giống một card mạng có băng thông cố định).
+        self.upload_rate_limit = upload_rate_limit
+        self._upload_lock = threading.Lock()
 
         self.server_socket: Optional[socket.socket] = None
         self.is_running = False
@@ -161,10 +177,46 @@ class PeerNode:
 
                 if req_type == MessageType.REQUEST.value:
                     piece_idx = req.get("piece_index")
+<<<<<<< Updated upstream
                     if piece_idx is not None:
                         data = pm.read_piece(piece_idx)
                         if data:
                             send_msg(conn, create_piece_msg(piece_idx, data))
+=======
+                    # REQUEST ngầm thể hiện Peer đang interested. Trạng thái này
+                    # được quản lý theo peer_id, không theo từng connection.
+                    self._choking.set_interested(remote_peer_id, True)
+                    self._choking.recalculate()
+                    is_unchoked = self._choking.is_unchoked(remote_peer_id)
+                    if not is_unchoked:
+                        if self._send(conn, create_choke_msg()):
+                            with self._sock_lock:
+                                 self._sent_choking_states[conn] = False
+                        continue
+
+                    # Chỉ gửi UNCHOKE khi trạng thái trên socket thay đổi
+                    # hoặc socket chưa từng nhận trạng thái; không gửi lặp
+                    # trong mọi REQUEST.
+                    self._send_choking_state(conn, True)
+                    if piece_idx is not None:
+                        data = pm.read_piece(piece_idx)
+                        if data:
+                            if self.upload_rate_limit:
+                                with self._upload_lock:
+                                    time.sleep(len(data) / self.upload_rate_limit)
+                            # Chỉ tính đóng góp sau khi sendall thành công; không
+                            # tính request hoặc piece đọc lỗi là upload hợp lệ.
+                            if self._send(conn, create_piece_msg(piece_idx, data)):
+                                self._choking.record_upload(remote_peer_id, len(data))
+                        else:
+                            self._send(conn, {"type": MessageType.ERROR.value, "piece_index": piece_idx})
+                elif req_type == MessageType.INTERESTED.value:
+                    self._choking.set_interested(remote_peer_id, True)
+                    self._choking.recalculate()
+
+                elif req_type == MessageType.NOT_INTERESTED.value:
+                    self._choking.set_interested(remote_peer_id, False)
+>>>>>>> Stashed changes
 
                 elif req_type == MessageType.KEEP_ALIVE.value:
                     pass  # Không làm gì, chỉ để giữ kết nối sống

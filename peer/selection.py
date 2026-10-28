@@ -8,7 +8,7 @@ def choose_next_piece(missing_pieces: List[int], peer_bitfields: Dict[str, List[
     Args:
         missing_pieces: Danh sách các chỉ số piece mà local peer còn thiếu.
         peer_bitfields: Dictionary { peer_id: bitfield_list } của tất cả các peer đang kết nối.
-        strategy: "rarest_first" hoặc "random".
+        strategy: "rarest_first", "random" hoặc "sequential".
         
     Returns:
         Chỉ số piece_index tốt nhất nên tải tiếp theo, hoặc None nếu không peer nào sở hữu mảnh thiếu.
@@ -28,6 +28,10 @@ def choose_next_piece(missing_pieces: List[int], peer_bitfields: Dict[str, List[
 
     if not candidate_counts:
         return None
+
+    if strategy == "sequential":
+        # Tải theo thứ tự 0, 1, 2, ... (giống tải HTTP thông thường) để so sánh.
+        return min(candidate_counts.keys())
 
     if strategy == "random":
         return random.choice(list(candidate_counts.keys()))

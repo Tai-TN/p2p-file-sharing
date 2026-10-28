@@ -1,0 +1,10 @@
+run,strategy,complete,pct_done,rare_got,rare_total,finish_time
+1,rarest_first,True,100.0,6,6,6.60899999999674
+1,random,False,95.3125,3,6,
+1,sequential,False,93.75,2,6,
+2,rarest_first,True,100.0,6,6,6.39100000000326
+2,random,False,95.3125,3,6,
+2,sequential,False,93.75,2,6,
+3,rarest_first,True,100.0,6,6,6.625
+3,random,False,93.75,2,6,
+3,sequential,False,93.75,2,6,
