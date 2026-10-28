@@ -1,5 +1,6 @@
 import socket
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 from storage.piece_manager import PieceManager
@@ -30,7 +31,8 @@ class PeerNode:
                  regular_slots: int = 2,
                  optimistic_slots: int = 1,
                  choking_interval: float = 20.0,
-                 measurement_window: float = 30.0):
+                 measurement_window: float = 30.0,
+                 upload_rate_limit: Optional[float] = None):
         self.peer_id = peer_id
         self.host = host
         self.port = port
@@ -44,6 +46,12 @@ class PeerNode:
         if piece_manager is not None:
             info_hash = piece_manager.metainfo["info_hash"]
             self._piece_managers[info_hash] = piece_manager
+
+        # Giới hạn tốc độ upload (byte/giây) để giả lập mạng thật khi thí nghiệm.
+        # None = không giới hạn. Mọi kết nối dùng chung một "đường truyền", nên
+        # gửi tuần tự qua _upload_lock (giống một card mạng có băng thông cố định).
+        self.upload_rate_limit = upload_rate_limit
+        self._upload_lock = threading.Lock()
 
         self.server_socket: Optional[socket.socket] = None
         self.is_running = False
@@ -206,7 +214,7 @@ class PeerNode:
                     if not is_unchoked:
                         if self._send(conn, create_choke_msg()):
                             with self._sock_lock:
-                                 False
+                                 self._sent_choking_states[conn] = False
                         continue
 
                     # Chỉ gửi UNCHOKE khi trạng thái trên socket thay đổi
@@ -216,6 +224,9 @@ class PeerNode:
                     if piece_idx is not None:
                         data = pm.read_piece(piece_idx)
                         if data:
+                            if self.upload_rate_limit:
+                                with self._upload_lock:
+                                    time.sleep(len(data) / self.upload_rate_limit)
                             # Chỉ tính đóng góp sau khi sendall thành công; không
                             # tính request hoặc piece đọc lỗi là upload hợp lệ.
                             if self._send(conn, create_piece_msg(piece_idx, data)):
