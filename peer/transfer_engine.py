@@ -3,7 +3,6 @@ import json
 import time
 import socket
 import base64
-import random
 import threading
 from typing import Dict, List, Optional
 from storage.piece_manager import PieceManager
@@ -13,11 +12,16 @@ from protocol.messages import (
     recv_msg,
     create_announce_msg,
     create_get_peers_msg,
-    create_request_msg,
 )
 from .selection import choose_next_piece
 from .connection import PeerConnection
 from .peer_selector import PeerSelector
+
+# Peer bị ngắt do chết / gửi sai dữ liệu sẽ bị bỏ qua trong khoảng thời gian này (giây).
+FAILED_PEER_COOLDOWN = 120.0
+# Số lần gửi sai dữ liệu tối đa trước khi ngắt kết nối peer.
+MAX_BAD_DATA_STRIKES = 4
+
 
 class TransferEngine:
     """
@@ -25,6 +29,7 @@ class TransferEngine:
 
     Lớp này kết nối Tracker, khám phá các Peer, tạo worker tải song song
     và phối hợp với PeerNode để cập nhật đóng góp cho Tit-for-Tat.
+    Đồng thời phát hiện peer chết / gửi sai dữ liệu và báo cáo lên Tracker.
     """
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
@@ -45,10 +50,15 @@ class TransferEngine:
         self.lock = threading.Lock()  # Bảo vệ danh sách Peer và piece đang được tải.
 
         # Bảng thông tin các Peer đã biết từ Tracker:
-        # peer_id -> địa chỉ TCP và bitfield hiện tại.
+        # peer_id -> địa chỉ TCP, bitfield hiện tại và số lần gửi sai dữ liệu.
         self.connected_peers: Dict[str, Dict] = {}
         # Một selector dùng chung cho mọi worker để đếm tải theo từng peer.
         self.peer_selector = PeerSelector()
+
+        # Blacklist tạm: peer_id -> thời điểm bị ngắt.
+        self.failed_peers: Dict[str, float] = {}
+        # Peer đã chết, chờ được báo cáo lên Tracker ở lần ANNOUNCE tiếp theo.
+        self.pending_bad_reports: set = set()
 
         # Các piece đã được một worker nhận xử lý; tránh nhiều worker tải trùng.
         self.in_flight_pieces: set = set()
@@ -67,9 +77,7 @@ class TransferEngine:
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
-        # Đăng ký bản thân với Tracker và lấy danh sách Peer hiện có.
-        # Dùng luôn danh sách trả về; trước đây bị bỏ đi nên worker phải chờ 2s
-        # rồi mới hỏi lại Tracker.
+        # Đăng ký bản thân với Tracker và dùng luôn danh sách Peer trả về.
         peers = self._announce_to_tracker(event="started")
         if peers:
             self._update_peer_connections(peers)
@@ -85,7 +93,6 @@ class TransferEngine:
             t.start()
             worker_threads.append(t)
 
-
         time_start = time.time()
 
         # Luồng chính chờ hoàn tất; định kỳ lưu bitfield để hỗ trợ resume.
@@ -98,12 +105,11 @@ class TransferEngine:
                 last_save = now
 
         if self.piece_manager.is_complete():
-            print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
             elapsed   = time.time() - time_start
             total_MB  = self.piece_manager.file_size / 1_048_576
             speed_MBs = total_MB / elapsed if elapsed > 0 else 0
             speed_Mbs = speed_MBs * 8
-            print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%!")
+            print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
             print(f"  Thời gian : {elapsed:.2f} giây")
             print(f"  Kích thước: {total_MB:.2f} MB")
             print(f"  Tốc độ TB : {speed_MBs:.2f} MB/s  ({speed_Mbs:.1f} Mbps)")
@@ -114,7 +120,8 @@ class TransferEngine:
         return False
 
     def _announce_to_tracker(self, event: str = "started") -> List[Dict]:
-        """Thông báo trạng thái với Tracker rồi lấy danh sách Peer khả dụng."""
+        """Thông báo trạng thái (kèm danh sách peer chết) với Tracker rồi lấy danh sách Peer."""
+        bad_to_report: List[str] = []
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5.0)
@@ -124,6 +131,11 @@ class TransferEngine:
             downloaded_bytes = int((self.piece_manager.progress_percentage() / 100.0) * self.piece_manager.file_size)
             left_bytes = self.piece_manager.file_size - downloaded_bytes
 
+            # Lấy danh sách peer chết cần báo cáo và xóa khỏi hàng chờ
+            with self.lock:
+                bad_to_report = list(self.pending_bad_reports)
+                self.pending_bad_reports.clear()
+
             msg = create_announce_msg(
                 info_hash=self.info_hash,
                 peer_id=self.peer_id,
@@ -131,11 +143,15 @@ class TransferEngine:
                 ip=self.my_ip,          # IP thực để Tracker lưu đúng địa chỉ
                 event=event,
                 downloaded=downloaded_bytes,
-                left=left_bytes
+                left=left_bytes,
+                bad_peers=bad_to_report  # Báo cáo peer chết
             )
+            if bad_to_report:
+                print(f"[TransferEngine {self.peer_id}] Báo cáo {len(bad_to_report)} peer chết lên Tracker: {bad_to_report}")
             send_msg(sock, msg)
             recv_msg(sock)
             sock.close()
+            bad_to_report = []  # Đã gửi thành công, không cần đưa lại vào hàng chờ
 
             # Sau announce, mở một request riêng để lấy danh sách Peer.
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -150,6 +166,10 @@ class TransferEngine:
                 return p_resp["peers"]
             return []
         except Exception:
+            # Gửi báo cáo thất bại → đưa lại vào hàng chờ để lần sau gửi tiếp
+            if bad_to_report:
+                with self.lock:
+                    self.pending_bad_reports.update(bad_to_report)
             return []
 
     def start_seeding(self) -> None:
@@ -180,26 +200,33 @@ class TransferEngine:
             if not p_id or not ip or not port:
                 continue
 
-            # Chỉ đọc bảng trong lock; không giữ lock trong lúc kết nối mạng.
+            # Kiểm tra nhanh trong lock (không làm network ở đây)
             with self.lock:
-                if p_id in self.connected_peers or p_id == self.peer_id:
+                if p_id == self.peer_id or p_id in self.connected_peers:
                     continue
+                # Peer vừa bị ngắt do chết/gửi sai dữ liệu → bỏ qua trong thời gian cooldown
+                failed_at = self.failed_peers.get(p_id)
+                if failed_at is not None:
+                    if time.time() - failed_at < FAILED_PEER_COOLDOWN:
+                        continue
+                    del self.failed_peers[p_id]
 
             # Connection probe chỉ dùng lấy bitfield, worker sẽ tạo connection dài hạn riêng.
             connection = self._create_connection(p_id, ip, port)
             if connection is None:
                 continue
 
-            bitfield = connection.bitfield
+            bitfield = list(connection.bitfield or [])
             connection.close()
 
             with self.lock:
                 if p_id not in self.connected_peers:
                     # Không lưu socket dùng chung; mỗi worker tự quản lý socket của mình.
                     self.connected_peers[p_id] = {
-                        "ip":      ip,
-                        "port":    port,
-                        "bitfield": bitfield
+                        "bitfield":       bitfield,
+                        "ip":             ip,
+                        "port":           port,
+                        "bad_data_count": 0,
                     }
                     have_count = sum(1 for b in bitfield if b)
                     print(f"[TransferEngine {self.peer_id}] Biết Peer {p_id} ({ip}:{port}) "
@@ -214,7 +241,11 @@ class TransferEngine:
                     bf[piece_index] = True
 
     def _create_connection(self, peer_id: str, ip: str, port: int) -> Optional[PeerConnection]:
-        """Tạo PeerConnection và thực hiện handshake với Peer từ xa."""
+        """Tạo PeerConnection và thực hiện handshake với Peer từ xa.
+
+        recv_msg/send_msg giờ ném exception khi lỗi, nên bọc try để
+        lỗi mạng không làm chết luồng gọi (worker / announce).
+        """
         connection = PeerConnection(
             local_peer_id=self.peer_id,
             remote_peer_id=peer_id,
@@ -223,13 +254,20 @@ class TransferEngine:
             port=port,
             on_have=self._on_peer_have,
         )
-        if not connection.connect():
-            return None
-        return connection
+        try:
+            if connection.connect():
+                return connection
+        except Exception:
+            pass
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return None
 
     def _worker_loop(self, worker_id: int) -> None:
         """Worker chọn piece, tải piece và tự quản lý các socket của mình."""
-        # Socket riêng của worker: { peer_id: socket }.
+        # Connection riêng của worker: { peer_id: PeerConnection }.
         # Choking vẫn tính theo peer_id, không tính theo số socket.
         my_conns: Dict[str, PeerConnection] = {}
 
@@ -270,22 +308,25 @@ class TransferEngine:
                 if not already_taken:
                     self.in_flight_pieces.add(target_piece)
             if already_taken:
-                # Ngủ NGOÀI lock (trước đây ngủ trong lock, chặn các worker khác).
                 time.sleep(0.05)
                 continue
 
             # Bị CHOKE chỉ làm request này thất bại; Peer vẫn được giữ lại để thử sau.
-            success = self._download_piece(target_piece, my_conns)
+            try:
+                success = self._download_piece(target_piece, my_conns)
+            except Exception as e:
+                # Lưới an toàn: lỗi bất ngờ không được làm chết worker
+                print(f"[Worker-{worker_id}] Lỗi không mong muốn khi tải piece {target_piece}: {e}")
+                success = False
 
             with self.lock:
                 self.in_flight_pieces.discard(target_piece)
 
             if not success:
-                # Nghỉ ngắn. Peer lỗi/CHOKE đã bị PeerSelector tạm loại bằng
-                # cooldown/backoff, nên không cần chặn cả worker 0.5s ở đây.
+                # Peer lỗi/CHOKE đã bị PeerSelector tạm loại bằng cooldown/backoff.
                 time.sleep(0.05)
 
-        # Đóng các socket do worker sở hữu khi worker kết thúc.
+        # Đóng các connection do worker sở hữu khi worker kết thúc.
         for connection in my_conns.values():
             connection.close()
             with self.lock:
@@ -293,10 +334,13 @@ class TransferEngine:
 
     def _download_piece(self, piece_index: int, my_conns: Dict[str, PeerConnection]) -> bool:
         """
-        Tải một piece bằng socket riêng của worker.
+        Tải một piece bằng connection riêng của worker.
 
         ``my_conns`` có dạng ``{peer_id: PeerConnection}`` và không được
         dùng chung giữa các worker; slot choking vẫn được tính theo peer_id.
+
+        Mỗi request đã reserve trong PeerSelector được kết thúc ĐÚNG MỘT lần
+        bằng record_success / record_choke / record_failure (qua _fail).
         """
         with self.lock:
             available_peers = [
@@ -321,79 +365,120 @@ class TransferEngine:
         if connection is None:
             connection = self._create_connection(p_id, ip, port)
             if connection is None:
-                # Đã reserve nhưng không tạo được connection nên phải release.
-                self.peer_selector.record_failure(p_id)
-                return False
-            if not connection.send_interested():
+                return self._fail(p_id, my_conns)
+            try:
+                interested_ok = connection.send_interested()
+            except Exception:
+                interested_ok = False
+            if not interested_ok:
                 connection.close()
-                # Gửi INTERESTED thất bại cũng được tính là request lỗi.
-                self.peer_selector.record_failure(p_id)
-                return False
-            # INTERESTED là tín hiệu cho server biết worker đang cần piece.
+                return self._fail(p_id, my_conns)
             my_conns[p_id] = connection
             with self.lock:
                 self._worker_connections.add(connection)
 
-        request_settled = False
+        # ── Giai đoạn 1+2: Gửi REQUEST và nhận phản hồi ──────────────────
         try:
             connection.set_timeout(45.0)
-
-            # PeerConnection tự gửi REQUEST, xử lý các message trung gian và trả về
-            # PIECE hoặc CHOKE cho TransferEngine.
-            # Chỉ đo thời gian truyền request, không tính thời gian handshake.
-            # perf_counter() có độ phân giải micro giây trên mọi hệ điều hành.
-            # time.monotonic() trên Windows (Python <= 3.12) chỉ chính xác ~15,6 ms:
-            # mảnh tải nhanh trên localhost sẽ đo ra 0 giây, record_success() báo lỗi
-            # và lần tải THÀNH CÔNG bị tính là peer lỗi (bị phạt, backoff, đóng socket).
+            # perf_counter() chính xác tới micro giây trên mọi hệ điều hành
+            # (time.monotonic() trên Windows chỉ ~15,6 ms → piece nhanh đo ra 0s).
             request_started = time.perf_counter()
             resp = connection.request_piece(piece_index)
-            # Chặn dưới 1 micro giây để không bao giờ chia cho 0.
             request_elapsed = max(time.perf_counter() - request_started, 1e-6)
-            if not resp:
-                raise ConnectionError("Peer đóng connection khi đang chờ message")
-            if resp.get("type") == MessageType.CHOKE.value:
-                # CHOKE là trạng thái tạm thời, không phải lỗi kết nối.
-                self.peer_selector.record_choke(p_id)
-                request_settled = True
-                return False
+        except socket.timeout:
+            # Peer chậm nhưng chưa chắc đã chết: chỉ bỏ connection này để lần sau tạo lại.
+            return self._fail(p_id, my_conns, drop_conn=True)
+        except (EOFError, OSError):
+            # Peer đóng kết nối / lỗi mạng → coi là peer chết, báo lên Tracker.
+            return self._fail(p_id, my_conns, drop_conn=True, dead=True)
+        except Exception:
+            # JSON hỏng / sai định dạng → peer gửi dữ liệu sai, luồng tin không còn tin cậy.
+            return self._fail(p_id, my_conns, drop_conn=True, bad_data=True)
 
-            if resp.get("type") == MessageType.PIECE.value:
-                if resp.get("piece_index") != piece_index:
-                    raise ConnectionError("PIECE sai số mảnh, luồng tin bị lệch")
-                if resp.get("piece_index") == piece_index:
-                    piece_data = base64.b64decode(resp["data"])
-                    if self.piece_manager.write_piece(piece_index, piece_data):
-                        # Chỉ cập nhật tốc độ sau khi dữ liệu đã ghi và xác minh thành công.
-                        self.peer_selector.record_success(
-                            p_id,
-                            len(piece_data),
-                            request_elapsed,
-                        )
-                        request_settled = True
-                        # Chỉ ghi nhận đóng góp sau khi checksum và ghi đĩa thành công.
-                        # PeerNode dùng số liệu này để xếp hạng regular unchoking.
-                        if self.peer_node:
-                            self.peer_node.record_download(p_id, len(piece_data))
-                        print(f"[Worker-{self.peer_id}] Piece {piece_index} ✓ ← {p_id} "
-                              f"({self.piece_manager.progress_percentage():.1f}%)")
-                        if self.peer_node:
-                            self.peer_node.broadcast_have(piece_index)
-                        return True
+        if not resp:
+            return self._fail(p_id, my_conns, drop_conn=True, dead=True)
 
-            self.peer_selector.record_failure(p_id)
-            request_settled = True
-        except Exception as e:
-            if not request_settled:
-                # Mọi lỗi bất ngờ phải release pending đúng một lần.
-                self.peer_selector.record_failure(p_id)
-            # Connection lỗi hoặc timeout: đóng kết nối hiện tại của worker này để lần sau tạo lại socket mới
-            connection = my_conns.pop(p_id, None)
-            if connection is not None:
-                connection.close()
-                with self.lock:
-                    self._worker_connections.discard(connection)
+        # ── Giai đoạn 3: Kiểm tra loại phản hồi ──────────────────────────
+        resp_type = resp.get("type")
 
+        if resp_type == MessageType.CHOKE.value:
+            # CHOKE là trạng thái tạm thời của Tit-for-Tat, không phải lỗi.
+            self.peer_selector.record_choke(p_id)
+            return False
+
+        if resp_type == MessageType.ERROR.value:
+            # Peer không đọc được piece này ở phía họ; không tính là gửi sai dữ liệu.
+            return self._fail(p_id, my_conns)
+
+        if resp_type != MessageType.PIECE.value:
+            return self._fail(p_id, my_conns, bad_data=True)
+
+        if resp.get("piece_index") != piece_index:
+            # Luồng tin bị lệch → bỏ connection này
+            return self._fail(p_id, my_conns, drop_conn=True, bad_data=True)
+
+        # ── Giai đoạn 4: Kiểm tra dữ liệu Base64 ─────────────────────────
+        raw_b64 = resp.get("data")
+        if not isinstance(raw_b64, str):
+            return self._fail(p_id, my_conns, bad_data=True)
+        try:
+            piece_data = base64.b64decode(raw_b64, validate=True)
+        except ValueError:
+            return self._fail(p_id, my_conns, bad_data=True)
+
+        # ── Giai đoạn 5: Ghi mảnh (kèm kiểm tra SHA-256) ─────────────────
+        try:
+            written = self.piece_manager.write_piece(piece_index, piece_data)
+        except OSError as e:
+            # Lỗi ổ đĩa phía mình, không phải lỗi của peer.
+            print(f"[TransferEngine {self.peer_id}] Lỗi ghi piece {piece_index}: {e}")
+            return self._fail(p_id, my_conns)
+
+        if not written:
+            # SHA-256 không khớp → peer gửi dữ liệu hỏng
+            return self._fail(p_id, my_conns, bad_data=True)
+
+        # ── Thành công ───────────────────────────────────────────────────
+        # Chỉ cập nhật tốc độ sau khi dữ liệu đã ghi và xác minh thành công.
+        self.peer_selector.record_success(p_id, len(piece_data), request_elapsed)
+        if self.peer_node:
+            # PeerNode dùng số liệu này để xếp hạng regular unchoking.
+            self.peer_node.record_download(p_id, len(piece_data))
+        print(f"[Worker-{self.peer_id}] Piece {piece_index} ✓ ← {p_id} "
+              f"({self.piece_manager.progress_percentage():.1f}%)")
+        if self.peer_node:
+            self.peer_node.broadcast_have(piece_index)
+        return True
+
+    def _fail(self, p_id: str, my_conns: Dict[str, PeerConnection], *,
+              drop_conn: bool = False, bad_data: bool = False, dead: bool = False) -> bool:
+        """
+        Kết thúc một request thất bại (release reserve trong PeerSelector đúng một lần).
+
+        drop_conn: đóng connection của worker tới peer này (lần sau tạo lại).
+        bad_data : tính 1 lần gửi sai dữ liệu; đủ ngưỡng thì ngắt peer.
+        dead     : peer chết → ngắt ngay và báo cáo lên Tracker.
+        Luôn trả về False để có thể viết `return self._fail(...)`.
+        """
+        self.peer_selector.record_failure(p_id)
+        if drop_conn:
+            self._drop_worker_connection(p_id, my_conns)
+        if dead:
+            self._disconnect_peer(p_id)
+        elif bad_data:
+            self._record_bad_data(p_id)
         return False
+
+    def _drop_worker_connection(self, p_id: str, my_conns: Dict[str, PeerConnection]) -> None:
+        """Đóng connection của worker hiện tại tới peer p_id."""
+        connection = my_conns.pop(p_id, None)
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            with self.lock:
+                self._worker_connections.discard(connection)
 
     def _piece_size(self, piece_index: int) -> int:
         """Trả về kích thước thực tế của piece, kể cả piece cuối."""
@@ -424,7 +509,7 @@ class TransferEngine:
                 os.remove(self.progress_file)
             except Exception:
                 pass
-    
+
     def _load_progress(self) -> None:
         """
         Khôi phục tiến độ theo ba trường hợp:
@@ -466,10 +551,8 @@ class TransferEngine:
 
         # Trường hợp 3: File mới → bitfield mặc định toàn False là đúng.
 
-
     def stop(self) -> None:
         """Dừng worker logic và xóa danh sách Peer đang được quản lý."""
-
         self.is_running = False
         with self.lock:
             for connection in tuple(self._worker_connections):
@@ -480,3 +563,42 @@ class TransferEngine:
             self.piece_manager.close()
         except Exception:
             pass
+
+    def _record_bad_data(self, p_id: str, max_strikes: int = MAX_BAD_DATA_STRIKES) -> None:
+        """
+        Ghi nhận 1 lần peer gửi sai dữ liệu (sai type, sai piece_index, sai Base64, SHA-256 fail...).
+        Khi đạt ngưỡng max_strikes thì tự động ngắt kết nối peer đó.
+        """
+        with self.lock:
+            info = self.connected_peers.get(p_id)
+            if info is None:
+                return  # Peer đã bị xóa trước đó
+            info["bad_data_count"] = info.get("bad_data_count", 0) + 1
+            count = info["bad_data_count"]
+
+        if count >= max_strikes:
+            print(
+                f"[TransferEngine {self.peer_id}] Peer {p_id} gửi sai dữ liệu "
+                f"{count} lần (ngưỡng {max_strikes}) → Ngắt kết nối."
+            )
+            self._disconnect_peer(p_id)
+        else:
+            print(
+                f"[TransferEngine {self.peer_id}] Peer {p_id} gửi sai dữ liệu "
+                f"(lần {count}/{max_strikes})."
+            )
+
+    def _disconnect_peer(self, p_id: str) -> None:
+        """
+        Xóa peer khỏi danh sách đang dùng, đưa vào blacklist tạm (failed_peers)
+        và hàng chờ báo cáo lên Tracker ở lần ANNOUNCE tiếp theo.
+
+        Connection của từng worker tới peer này sẽ tự bị đóng khi worker
+        dùng lại và gặp lỗi, hoặc khi worker kết thúc.
+        """
+        with self.lock:
+            if self.connected_peers.pop(p_id, None) is None:
+                return  # Đã bị worker khác ngắt trước đó
+            self.failed_peers[p_id] = time.time()
+            self.pending_bad_reports.add(p_id)
+        print(f"[TransferEngine {self.peer_id}] Ngắt Peer {p_id}, sẽ báo cáo lên Tracker.")

@@ -157,6 +157,9 @@ class PeerNode:
           1. Nhận HANDSHAKE → tra info_hash → tìm PieceManager
           2. Gửi HANDSHAKE_RESPONSE + BITFIELD
           3. Lặp nhận REQUEST → gửi PIECE (hoặc bỏ qua KEEP_ALIVE)
+
+        recv_msg ném EOFError/OSError khi peer ngắt kết nối; các lỗi đó
+        được bắt ở except bên dưới và kết nối được dọn dẹp trong finally.
         """
         conn.settimeout(60.0)  # Tự đóng nếu Peer ngắt kết nối hoặc im lặng quá 60 giây
 
@@ -214,7 +217,7 @@ class PeerNode:
                     if not is_unchoked:
                         if self._send(conn, create_choke_msg()):
                             with self._sock_lock:
-                                 self._sent_choking_states[conn] = False
+                                self._sent_choking_states[conn] = False
                         continue
 
                     # Chỉ gửi UNCHOKE khi trạng thái trên socket thay đổi
@@ -243,10 +246,10 @@ class PeerNode:
                 elif req_type == MessageType.KEEP_ALIVE.value:
                     pass  # Không làm gì, chỉ để giữ kết nối sống
 
-        except socket.timeout:
-            pass  # Timeout bình thường
+        except (EOFError, OSError, socket.timeout):
+            pass  # Peer ngắt kết nối / timeout bình thường
         except Exception:
-            pass
+            pass  # Dữ liệu JSON không hợp lệ → đóng kết nối
         finally:
             if remote_peer_id:
                 with self._sock_lock:
@@ -266,13 +269,21 @@ class PeerNode:
                 pass
 
     def _send(self, sock: socket.socket, message: Dict) -> bool:
-        """Serialize frames sent concurrently on the same TCP connection."""
+        """
+        Gửi tuần tự các frame trên cùng một kết nối TCP.
+
+        send_msg giờ ném OSError khi socket lỗi; bắt lại ở đây và trả về False
+        để luồng choking (_choking_loop) không bị chết khi một peer rớt mạng.
+        """
         with self._sock_lock:
             send_lock = self._send_locks.get(sock)
         if send_lock is None:
             return False
         with send_lock:
-            return send_msg(sock, message)
+            try:
+                return send_msg(sock, message)
+            except OSError:
+                return False
 
     def _choking_loop(self) -> None:
         """Định kỳ tính lại regular/optimistic slots và báo thay đổi cho Peer."""

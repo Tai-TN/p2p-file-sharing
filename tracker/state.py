@@ -16,6 +16,10 @@ class TrackerState:
         # Cấu trúc: { info_hash: { peer_id: { "ip": str, "port": int, "last_seen": float, "downloaded": int, "left": int } } }
         self.swarms: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
+        # Theo dõi số lần bị tố cáo: { info_hash: { bad_peer_id: set(reporter_ids) } }
+        # Nếu >= 2 peer khác nhau tố cáo cùng 1 peer -> xóa ngay
+        self._bad_reports: Dict[str, Dict[str, set]] = {}
+
     def register_peer(self, info_hash: str, peer_id: str, ip: str, port: int, downloaded: int = 0, left: int = 0, event: str = "started") -> bool:
         """Đăng ký hoặc cập nhật trạng thái hoạt động của 1 Peer trong Swarm."""
         with self.lock:
@@ -65,6 +69,37 @@ class TrackerState:
                 })
 
             return active_peers
+
+    def report_bad_peers(self, info_hash: str, reporter_id: str, bad_peer_ids: List[str]) -> List[str]:
+        """
+        Nhận báo cáo từ reporter_id rằng các peer trong bad_peer_ids đã chết.
+        Nếu >= 2 peer khác nhau tố cáo cùng 1 peer -> xóa ngay khỏi Swarm.
+        Trả về danh sách peer đã bị xóa.
+        """
+        removed = []
+        with self.lock:
+            if info_hash not in self._bad_reports:
+                self._bad_reports[info_hash] = {}
+
+            reports = self._bad_reports[info_hash]
+            swarm = self.swarms.get(info_hash, {})
+
+            for bad_id in bad_peer_ids:
+                if bad_id == reporter_id:
+                    continue  # Không tự tố cáo chính mình
+
+                if bad_id not in reports:
+                    reports[bad_id] = set()
+                reports[bad_id].add(reporter_id)
+
+                # Đủ ngưỡng tố cáo (>= 2 peer khác nhau) -> xóa ngay
+                if len(reports[bad_id]) >= 2 and bad_id in swarm:
+                    del swarm[bad_id]
+                    del reports[bad_id]  # Reset bộ đếm
+                    removed.append(bad_id)
+                    print(f"[Tracker State] Peer {bad_id} bị xóa khỏi swarm {info_hash[:8]}... do bị tố cáo chết bởi >= 2 peer.")
+
+        return removed
 
     def cleanup_stale_peers(self) -> int:
         """Dọn dẹp các Peer đã dừng hoạt động hoặc mất kết nối quá thời hạn timeout."""
