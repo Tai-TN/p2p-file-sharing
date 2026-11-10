@@ -24,6 +24,7 @@ import socket
 import threading
 import logging
 from typing import Optional, Callable, Dict, Any
+from protocol.auth import connect_tracker
 
 from protocol.messages import (
     MessageType,
@@ -92,6 +93,7 @@ class TrackerSignalChannel:
 
         # Callback khi nhận PUNCH_FAILED.
         self.on_punch_failed: Optional[Callable[[str], None]] = None
+        self.on_relay_invite: Optional[Callable[[Dict[str, Any]], None]] = None
 
     # ── Public API ────────────────────────────────────────────────────────── #
 
@@ -107,8 +109,6 @@ class TrackerSignalChannel:
             return True
 
         sock = self._connect_and_register()
-        if not sock:
-            return False
 
         with self._sock_lock:
             self._sock = sock
@@ -130,7 +130,7 @@ class TrackerSignalChannel:
 
         logger.info(f"[SignalChannel {self.peer_id}] Đã kết nối tới Tracker "
                     f"{self.tracker_host}:{self.tracker_port}")
-        return True
+        return sock is not None
 
     def stop(self) -> None:
         """Đóng kênh signaling và dừng các thread ngầm."""
@@ -177,9 +177,8 @@ class TrackerSignalChannel:
         """
         sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.connect_timeout)
-            sock.connect((self.tracker_host, self.tracker_port))
+            sock = connect_tracker(self.tracker_host, self.tracker_port,
+                                   timeout=self.connect_timeout)
 
             reg_msg = create_signal_register_msg(
                 peer_id=self.peer_id,
@@ -264,6 +263,13 @@ class TrackerSignalChannel:
                         self.on_punch_failed(reason)
                     except Exception as e:
                         logger.error(f"[SignalChannel] Lỗi trong on_punch_failed callback: {e}")
+
+            elif msg_type == MessageType.RELAY_INVITE.value:
+                if self.on_relay_invite:
+                    try:
+                        self.on_relay_invite(msg)
+                    except Exception as e:
+                        logger.error(f"[SignalChannel] Lỗi trong on_relay_invite callback: {e}")
 
             else:
                 logger.debug(f"[SignalChannel] Message không xử lý: {msg_type}")

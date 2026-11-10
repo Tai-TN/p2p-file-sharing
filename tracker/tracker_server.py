@@ -2,12 +2,15 @@ import socket
 import threading
 import time
 import ipaddress
+import os
 from typing import Optional
+from protocol.auth import authenticate_client
 from protocol.messages import (
     MessageType, send_msg, recv_msg,
     create_punch_signal_msg, create_punch_failed_msg,
 )
 from .state import TrackerState
+from .relay import RelayManager
 
 
 class TrackerServer:
@@ -22,12 +25,18 @@ class TrackerServer:
         self.host = host
         self.port = port
         self.state = TrackerState(peer_timeout=peer_timeout)
+        self.auth_secret = os.environ.get("P2P_TRACKER_SECRET", "")
+        self.relay = RelayManager(self.state)
         # Client gửi KEEP_ALIVE mỗi 30 giây; cần chờ lâu hơn khoảng đó.
         self.signal_idle_timeout = signal_idle_timeout
         self.server_socket: Optional[socket.socket] = None
         self.is_running = False
         self.accept_thread: Optional[threading.Thread] = None
         self.cleanup_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._clients = set()
+        self._clients_lock = threading.Lock()
+        self._connection_slots = threading.BoundedSemaphore(256)
 
     def start(self) -> None:
         """Khởi động máy chủ Tracker Server và luồng dọn dẹp định kỳ."""
@@ -37,7 +46,9 @@ class TrackerServer:
         )  # Ipv4, TCP
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(128)  # # -> Listening socket, tối đa 128 người chờ
+        self.port = self.server_socket.getsockname()[1]
         self.is_running = True
+        self._stop_event.clear()
 
         print(
             f"[Tracker Server] Đang khởi chạy và lắng nghe tại {self.host}:{self.port}"
@@ -58,6 +69,11 @@ class TrackerServer:
         while self.is_running:
             try:
                 conn, addr = self.server_socket.accept()  # block
+                if not self._connection_slots.acquire(blocking=False):
+                    conn.close()
+                    continue
+                with self._clients_lock:
+                    self._clients.add(conn)
                 # Mỗi Peer kết nối đến được xử lý trên 1 Worker Thread riêng biệt
                 client_thread = threading.Thread(
                     target=self._handle_client, args=(conn, addr), daemon=True
@@ -76,8 +92,11 @@ class TrackerServer:
           - SIGNAL_REGISTER       → mở kênh persistent, vòng lặp chờ PUNCH_REQUEST.
         """
         try:
+            conn.settimeout(5.0)
+            if not authenticate_client(conn, self.auth_secret):
+                return
             msg = recv_msg(conn)
-            if not msg:
+            if not isinstance(msg, dict):
                 return
 
             msg_type = msg.get("type")
@@ -88,6 +107,14 @@ class TrackerServer:
                 self._handle_signal_channel(conn, addr, msg)
                 return   # _handle_signal_channel tự đóng khi xong
 
+            if msg_type == MessageType.RELAY_OPEN.value:
+                self.relay.open(conn, msg)
+                return
+
+            if msg_type == MessageType.RELAY_JOIN.value:
+                self.relay.join(conn, msg)
+                return
+
             if msg_type == MessageType.ANNOUNCE.value:
                 info_hash = msg.get("info_hash")
                 peer_id = msg.get("peer_id")
@@ -97,12 +124,35 @@ class TrackerServer:
                 left = msg.get("left", 0)
 
                 # Trường mới từ STUN (0 / rỗng nếu peer chưa chạy STUN)
-                udp_port  = int(msg.get("udp_port", 0) or 0)
-                public_ip = msg.get("public_ip", "").strip()
+                udp_port  = msg.get("udp_port", 0)
+                public_ip = msg.get("public_ip", "")
 
                 # Chọn IP tốt nhất để lưu vào state:
                 # Ưu tiên: public_ip (STUN) > ip (LAN tự báo) > client_ip (TCP socket)
-                announced_ip = msg.get("ip", "").strip()
+                announced_ip = msg.get("ip", "")
+                if (not isinstance(info_hash, str) or len(info_hash) != 64
+                        or not isinstance(peer_id, str) or not 1 <= len(peer_id) <= 64
+                        or not isinstance(peer_port, int) or not 1 <= peer_port <= 65535
+                        or not isinstance(udp_port, int) or not 0 <= udp_port <= 65535
+                        or not isinstance(announced_ip, str)
+                        or not isinstance(public_ip, str)
+                        or not isinstance(downloaded, int) or downloaded < 0
+                        or not isinstance(left, int) or left < 0
+                        or event not in ("started", "completed", "stopped")):
+                    send_msg(conn, {"type": MessageType.ANNOUNCE_RESPONSE.value,
+                                    "status": "ERROR"})
+                    return
+                announced_ip = announced_ip.strip()
+                public_ip = public_ip.strip()
+                try:
+                    if announced_ip:
+                        announced_ip = str(ipaddress.IPv4Address(announced_ip))
+                    if public_ip:
+                        public_ip = str(ipaddress.IPv4Address(public_ip))
+                except ipaddress.AddressValueError:
+                    send_msg(conn, {"type": MessageType.ANNOUNCE_RESPONSE.value,
+                                    "status": "ERROR"})
+                    return
                 peer_ip = announced_ip if announced_ip else client_ip
 
                 # Đăng ký thông tin peer
@@ -130,6 +180,9 @@ class TrackerServer:
                 info_hash = msg.get("info_hash")
                 request_peer_id = msg.get("peer_id")
 
+                if not isinstance(info_hash, str) or len(info_hash) != 64:
+                    return
+
                 peers_list = self.state.get_peers(
                     info_hash, exclude_peer_id=request_peer_id
                 )
@@ -144,6 +197,9 @@ class TrackerServer:
         except Exception as e:
             print(f"[Tracker Server] Lỗi xử lý client {addr}: {e}")
         finally:
+            with self._clients_lock:
+                self._clients.discard(conn)
+            self._connection_slots.release()
             try:
                 conn.close()
             except Exception:
@@ -161,11 +217,14 @@ class TrackerServer:
         """
         peer_id  = register_msg.get("peer_id", "")
         ip       = register_msg.get("ip", addr[0])
-        udp_port = int(register_msg.get("udp_port", 0) or 0)
-        tcp_port = int(register_msg.get("tcp_port", 0) or 0)
+        udp_port = register_msg.get("udp_port", 0)
+        tcp_port = register_msg.get("tcp_port", 0)
         candidates = self._valid_candidates(register_msg.get("candidates", []))
 
-        if not peer_id:
+        if (not isinstance(peer_id, str) or not 1 <= len(peer_id) <= 64
+                or not isinstance(ip, str) or not isinstance(udp_port, int)
+                or not 0 <= udp_port <= 65535 or not isinstance(tcp_port, int)
+                or not 1 <= tcp_port <= 65535):
             return
 
         # Bật TCP keepalive để OS phát hiện khi client đứt đột ngột
@@ -177,7 +236,10 @@ class TrackerServer:
                                            candidates)
 
         # Xác nhận với peer
-        send_msg(conn, {"type": MessageType.SIGNAL_READY.value, "peer_id": peer_id})
+        if not self.state.deliver_signal(peer_id,
+                {"type": MessageType.SIGNAL_READY.value, "peer_id": peer_id}):
+            self.state.unregister_signal_channel(peer_id, conn)
+            return
 
         try:
             while self.is_running:
@@ -223,14 +285,14 @@ class TrackerServer:
         Nếu target không có signal channel → gửi PUNCH_FAILED về requester.
         """
         if not target_peer_id:
-            send_msg(requesting_conn, create_punch_failed_msg("target_peer_id bị thiếu"))
+            self.state.deliver_signal(requesting_peer_id, create_punch_failed_msg("target_peer_id bị thiếu"))
             return
 
         requester_info = self.state.get_signal_info(requesting_peer_id)
         target_info    = self.state.get_signal_info(target_peer_id)
 
         if not target_info:
-            send_msg(requesting_conn,
+            self.state.deliver_signal(requesting_peer_id,
                      create_punch_failed_msg(f"Peer {target_peer_id} không có signal channel"))
             print(f"[Tracker Server] PUNCH_FAILED: {requesting_peer_id} → {target_peer_id} "
                   f"(target offline hoặc không hỗ trợ)")
@@ -238,7 +300,7 @@ class TrackerServer:
 
         if not requester_info:
             # Không nên xảy ra vì chính requester đã có channel — phòng thủ
-            send_msg(requesting_conn, create_punch_failed_msg("Lỗi nội bộ tracker"))
+            self.state.deliver_signal(requesting_peer_id, create_punch_failed_msg("Lỗi nội bộ tracker"))
             return
 
         # Gửi PUNCH_SIGNAL(requester's info) → target
@@ -254,8 +316,8 @@ class TrackerServer:
         )
 
         # Gửi PUNCH_SIGNAL(target's info) → requester (qua conn hiện tại)
-        send_msg(
-            requesting_conn,
+        self.state.deliver_signal(
+            requesting_peer_id,
             create_punch_signal_msg(
                 peer_id=target_peer_id,
                 ip=target_info["ip"],
@@ -291,25 +353,31 @@ class TrackerServer:
     def _periodic_cleanup(self) -> None:
         """Vòng lặp dọn dẹp các Peer không phản hồi định kỳ."""
         while self.is_running:
-            time.sleep(120)
+            if self._stop_event.wait(120):
+                break
             self.state.cleanup_stale_peers()
 
     def stop(self) -> None:
         """Dừng Tracker Server an toàn."""
         self.is_running = False
+        self._stop_event.set()
         if self.server_socket:
             try:
                 self.server_socket.close()
             except Exception:
                 pass
 
-        # Đóng tất cả signal channel đang mở để thread vòng lặp thoát ra
-        with self.state._sc_lock:
-            for info in list(self.state._signal_channels.values()):
-                try:
-                    info["sock"].close()
-                except Exception:
-                    pass
-            self.state._signal_channels.clear()
+        self.relay.close()
+        with self._clients_lock:
+            clients = list(self._clients)
+        for conn in clients:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
+        for thread in (self.accept_thread, self.cleanup_thread):
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
 
         print("[Tracker Server] Đã dừng thành công.")

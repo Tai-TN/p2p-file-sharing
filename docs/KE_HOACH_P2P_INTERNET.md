@@ -129,3 +129,17 @@ xác thực peer và chưa hỗ trợ nhiều seeder đồng thời trong một 
 Kiểm thử localhost đã truyền đủ file nhiều mảnh và so sánh SHA-256. Chưa kiểm thử
 được Fedora ↔ Android trên hai mạng thực tế; không coi kiểm thử localhost là bằng
 chứng xuyên NAT thành công.
+
+## Cập nhật relay và chế độ auto (07/11/2026)
+
+Client hiện mặc định `--transport auto`. Nó thử TCP trực tiếp bằng địa chỉ TCP đã
+quảng bá, rồi thử UDP trực tiếp tối đa 100 giây khi có STUN. Nếu không tạo được
+đường trực tiếp hoặc đường UDP đứt khi tải, client kết nối outbound tới relay TCP
+chạy chung cổng với tracker. Kênh signaling luôn mở, kể cả khi STUN thất bại.
+Tracker công khai dùng bí mật chung `P2P_TRACKER_SECRET` để xác thực kết nối.
+
+Cách triển khai VPS và lệnh chạy hiện tại ở [TRIEN_KHAI_VPS.md](TRIEN_KHAI_VPS.md).
+Các bước ngrok/Tailscale và UDP-only phía trên là lịch sử thử nghiệm, không phải
+quy trình chạy chế độ `auto`. Đã kiểm tra relay seeder → leecher và SHA-256 trên
+localhost; chưa có bằng chứng kiểm thử trên hai mạng Internet khác nhau hoặc hai
+hard NAT thật.

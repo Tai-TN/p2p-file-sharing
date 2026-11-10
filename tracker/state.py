@@ -45,10 +45,10 @@ class TrackerState:
                     print(f"[Tracker State] Peer {peer_id} đã thoát khỏi swarm {info_hash[:8]}...")
                 return True
 
-            # Chọn IP quảng bá tốt nhất:
-            # Ưu tiên public_ip từ STUN (chính xác nhất cho kết nối qua Internet).
-            # Nếu không có, dùng ip (LAN) mà peer tự báo.
-            advertised_ip = public_ip if public_ip else ip
+            # Địa chỉ STUN là endpoint UDP, không phải địa chỉ/cổng TCP.
+            # Chỉ dùng IP do peer cấu hình cho thử TCP trực tiếp.
+            # Public endpoint của STUN là UDP; không được ghép với TCP listen_port.
+            advertised_ip = ip
 
             swarm[peer_id] = {
                 "peer_id":   peer_id,
@@ -91,6 +91,11 @@ class TrackerState:
                 })
 
             return active_peers
+
+    def has_peer(self, info_hash: str, peer_id: str) -> bool:
+        with self.lock:
+            peer = self.swarms.get(info_hash, {}).get(peer_id)
+            return bool(peer and time.time() - peer["last_seen"] <= self.peer_timeout)
 
     def cleanup_stale_peers(self) -> int:
         """Dọn dẹp các Peer đã dừng hoạt động hoặc mất kết nối quá thời hạn timeout."""
@@ -148,6 +153,7 @@ class TrackerState:
                     pass
             self._signal_channels[peer_id] = {
                 "sock":     sock,
+                "send_lock": threading.Lock(),
                 "ip":       ip,
                 "udp_port": udp_port,
                 "tcp_port": tcp_port,
@@ -192,7 +198,9 @@ class TrackerState:
         sock = info["sock"]
         try:
             from protocol.messages import send_msg
-            if send_msg(sock, msg):
+            with info["send_lock"]:
+                sent = send_msg(sock, msg)
+            if sent:
                 return True
             self.unregister_signal_channel(target_peer_id, sock)
             return False
@@ -200,3 +208,6 @@ class TrackerState:
             print(f"[Tracker State] Lỗi gửi PUNCH_SIGNAL tới {target_peer_id}: {e}")
             self.unregister_signal_channel(target_peer_id, sock)
             return False
+
+    def deliver_signal(self, target_peer_id: str, msg: Dict[str, Any]) -> bool:
+        return self.deliver_punch_signal(target_peer_id, msg)

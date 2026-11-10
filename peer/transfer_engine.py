@@ -3,6 +3,7 @@ import json
 import time
 import socket
 import base64
+import binascii
 import random
 import threading
 from typing import Dict, List, Optional, Tuple, Any
@@ -18,6 +19,8 @@ from protocol.messages import (
 )
 from .selection import choose_next_piece
 from nat.stun_client import STUNClient, NATInfo, NATType
+from nat.relay import open_relay
+from protocol.auth import connect_tracker
 
 class TransferEngine:
     """
@@ -26,6 +29,7 @@ class TransferEngine:
     """
     HEARTBEAT_INTERVAL = 20.0
     PUNCH_RETRY_INTERVAL = 30.0
+    DIRECT_PROBE_TIMEOUT = 100.0
 
     def __init__(self, peer_id: str, tracker_host: str, tracker_port: int,
                  listen_port: int, piece_manager: PieceManager,
@@ -55,6 +59,9 @@ class TransferEngine:
         self._announce_thread: Optional[threading.Thread] = None
         self._last_tracker_error: Optional[str] = None
         self._next_punch_attempt: Dict[str, float] = {}
+        self.current_path: Optional[str] = None
+        self._auto_sock: Optional[socket.socket] = None
+        self._worker_threads: List[threading.Thread] = []
 
         # Quản lý danh sách các peer đã kết nối
         self.connected_peers: Dict[str, Dict] = {}
@@ -77,12 +84,15 @@ class TransferEngine:
 
         # Tạo và chạy luồng Worker Pool tải song song
         worker_threads = []
-        for i in range(1 if self.transport == "udp" else self.max_workers):
-            target = self._udp_worker_loop if self.transport == "udp" else self._worker_loop
-            args = () if self.transport == "udp" else (i,)
+        worker_count = 1 if self.transport in ("auto", "udp") else self.max_workers
+        for i in range(worker_count):
+            target = (self._auto_worker_loop if self.transport == "auto" else
+                      self._udp_worker_loop if self.transport == "udp" else self._worker_loop)
+            args = (i,) if self.transport == "tcp" else ()
             t = threading.Thread(target=target, args=args, daemon=True)
             t.start()
             worker_threads.append(t)
+        self._worker_threads = worker_threads
 
 
         time_start = time.time()
@@ -128,7 +138,7 @@ class TransferEngine:
         self._announce_thread.start()
 
     def _tracker_request(self, message: Dict, response_type: MessageType) -> Dict:
-        with socket.create_connection((self.tracker_host, self.tracker_port), timeout=5.0) as sock:
+        with connect_tracker(self.tracker_host, self.tracker_port, timeout=5.0) as sock:
             if not send_msg(sock, message):
                 raise ConnectionError("Không gửi được yêu cầu")
             response = recv_msg(sock)
@@ -190,13 +200,13 @@ class TransferEngine:
         while not self._announce_stop.wait(self.HEARTBEAT_INTERVAL):
             event = "completed" if self.piece_manager.is_complete() else "started"
             peers = self._announce_to_tracker(event=event)
-            if peers and not self.piece_manager.is_complete():
+            if peers and self.transport == "tcp" and not self.piece_manager.is_complete():
                 self._update_peer_connections(peers)
 
     def _update_peer_connections(self, peers_list: List[Dict]) -> None:
         """Kết nối tới các Peer mới trong danh sách thu thập từ Tracker."""
-        if self.transport == "udp":
-            return  # UDP worker tự yêu cầu punch và chỉ dùng endpoint đã xác nhận
+        if self.transport != "tcp":
+            return
         for p_info in peers_list:
             p_id = p_info.get("peer_id")
             ip   = p_info.get("ip")
@@ -212,22 +222,6 @@ class TransferEngine:
 
             # Làm network NGOÀI lock — worker khác vẫn tải bình thường trong lúc này
             sock = self._connect_and_handshake(ip, port)
-
-            # Nếu kết nối trực tiếp thất bại và ta có signal channel, thử đục lỗ NAT qua Tracker
-            if not sock and self.signal_channel and getattr(self.signal_channel, "is_connected", False):
-                udp_port = p_info.get("udp_port", 0)
-                if udp_port:
-                    now = time.monotonic()
-                    with self.lock:
-                        should_request = now >= self._next_punch_attempt.get(p_id, 0.0)
-                        if should_request:
-                            self._next_punch_attempt[p_id] = now + self.PUNCH_RETRY_INTERVAL
-                    if should_request:
-                        print(f"[TransferEngine {self.peer_id}] Kết nối TCP tới {p_id} ({ip}:{port}) thất bại. Gửi PUNCH_REQUEST...")
-                        try:
-                            self.signal_channel.request_punch(p_id)
-                        except Exception as e:
-                            print(f"[TransferEngine {self.peer_id}] Lỗi khi yêu cầu đục lỗ NAT tới {p_id}: {e}")
 
             if not sock:
                 continue
@@ -250,6 +244,7 @@ class TransferEngine:
                         "port":      port
                     }
                     print(f"[TransferEngine {self.peer_id}] Kết nối P2P thành công tới Peer {p_id} ({ip}:{port})")
+                    self.current_path = "DIRECT_TCP"
                 else:
                     sock.close()  # Worker khác vừa kết nối peer này → đóng socket thừa
 
@@ -288,6 +283,7 @@ class TransferEngine:
                 time.sleep(2.0)
 
         print(f"[TransferEngine {self.peer_id}] Tải UDP trực tiếp từ {seeder_id}")
+        self.current_path = "DIRECT_UDP"
         for piece_index in self.piece_manager.missing_pieces():
             if not self.is_running:
                 return
@@ -296,7 +292,7 @@ class TransferEngine:
                 data = self.udp_transfer.request_piece(
                     seeder_id, self.info_hash, piece_index, length)
                 if data is not None and self.piece_manager.write_piece(piece_index, data):
-                    print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ UDP "
+                    print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ DIRECT_UDP "
                           f"({self.piece_manager.progress_percentage():.1f}%)")
                     break
                 print(f"[TransferEngine {self.peer_id}] Mảnh {piece_index} "
@@ -307,13 +303,16 @@ class TransferEngine:
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
         """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5.0)
             sock.connect((ip, port))
 
             hs_msg = create_handshake_msg(self.info_hash, self.peer_id)
-            send_msg(sock, hs_msg)
+            if not send_msg(sock, hs_msg):
+                sock.close()
+                return None
 
             resp = recv_msg(sock)
             if resp and resp.get("type") == MessageType.HANDSHAKE_RESPONSE.value:
@@ -322,7 +321,180 @@ class TransferEngine:
             sock.close()
             return None
         except Exception:
+            if sock is not None:
+                sock.close()
             return None
+
+    def _handshake_existing_socket(self, sock: socket.socket) -> bool:
+        if not send_msg(sock, create_handshake_msg(self.info_hash, self.peer_id)):
+            return False
+        response = recv_msg(sock)
+        return (isinstance(response, dict)
+                and response.get("type") == MessageType.HANDSHAKE_RESPONSE.value
+                and response.get("info_hash") == self.info_hash)
+
+    def _download_tcp_session(self, sock: socket.socket, peer_id: str, path: str) -> bool:
+        """Tải các mảnh peer có qua một socket direct hoặc relay."""
+        self.current_path = path
+        self._auto_sock = sock
+        try:
+            bitfield_msg = recv_msg(sock)
+            if not isinstance(bitfield_msg, dict) or bitfield_msg.get("type") != MessageType.BITFIELD.value:
+                return False
+            bitfield = bitfield_msg.get("bitfield")
+            if not isinstance(bitfield, list) or len(bitfield) > self.piece_manager.num_pieces:
+                return False
+            print(f"[TransferEngine {self.peer_id}] Đường {path} tới {peer_id} sẵn sàng")
+            for piece_index in self.piece_manager.missing_pieces():
+                if not self.is_running:
+                    return False
+                if piece_index >= len(bitfield) or bitfield[piece_index] not in (True, 1):
+                    continue
+                sock.settimeout(15.0)
+                if not send_msg(sock, create_request_msg(piece_index)):
+                    return False
+                response = recv_msg(sock)
+                if (not isinstance(response, dict) or response.get("type") != MessageType.PIECE.value
+                        or response.get("piece_index") != piece_index):
+                    return False
+                encoded = response.get("data")
+                if not isinstance(encoded, str):
+                    return False
+                try:
+                    data = base64.b64decode(encoded, validate=True)
+                except (ValueError, binascii.Error):
+                    return False
+                if not self.piece_manager.write_piece(piece_index, data):
+                    return False
+                print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ {path} "
+                      f"({self.piece_manager.progress_percentage():.1f}%)")
+                if self.peer_node:
+                    self.peer_node.broadcast_have(piece_index)
+            return self.piece_manager.is_complete()
+        except (OSError, ValueError) as exc:
+            print(f"[TransferEngine {self.peer_id}] Đường {path} lỗi: {exc}")
+            return False
+        finally:
+            if self._auto_sock is sock:
+                self._auto_sock = None
+            sock.close()
+
+    def _find_udp_peer(self, peers: List[Dict]) -> Optional[str]:
+        if not (self.nat_info and self.udp_transfer and self.signal_channel
+                and self.signal_channel.is_connected):
+            return None
+        candidates = [p for p in peers if p.get("left") == 0
+                      and isinstance(p.get("udp_port"), int) and p["udp_port"] > 0]
+        if not candidates:
+            return None
+        deadline = time.monotonic() + self.DIRECT_PROBE_TIMEOUT
+        attempts: Dict[str, int] = {}
+        while self.is_running and time.monotonic() < deadline:
+            for peer in candidates:
+                peer_id = peer.get("peer_id")
+                if not isinstance(peer_id, str):
+                    continue
+                if self.udp_transfer.manager.get_endpoint(peer_id):
+                    return peer_id
+                now = time.monotonic()
+                if (attempts.get(peer_id, 0) < 3
+                        and now >= self._next_punch_attempt.get(peer_id, 0)):
+                    attempts[peer_id] = attempts.get(peer_id, 0) + 1
+                    self._next_punch_attempt[peer_id] = now + self.PUNCH_RETRY_INTERVAL
+                    print(f"[TransferEngine {self.peer_id}] Thử DIRECT_UDP tới {peer_id} "
+                          f"{attempts[peer_id]}/3")
+                    self.signal_channel.request_punch(peer_id)
+            if not self.signal_channel.is_connected:
+                break
+            time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        print(f"[TransferEngine {self.peer_id}] DIRECT_UDP không khả dụng sau "
+              f"tối đa {self.DIRECT_PROBE_TIMEOUT:.0f} giây; chuyển RELAY")
+        return None
+
+    def _download_udp_session(self, peer_id: str) -> bool:
+        self.current_path = "DIRECT_UDP"
+        print(f"[TransferEngine {self.peer_id}] Đường DIRECT_UDP tới {peer_id} sẵn sàng")
+        for piece_index in self.piece_manager.missing_pieces():
+            if not self.is_running:
+                return False
+            _, length = self.piece_manager._get_piece_bounds(piece_index)
+            for attempt in range(3):
+                data = self.udp_transfer.request_piece(peer_id, self.info_hash,
+                                                       piece_index, length)
+                if data is not None and self.piece_manager.write_piece(piece_index, data):
+                    print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ DIRECT_UDP "
+                          f"({self.piece_manager.progress_percentage():.1f}%)")
+                    if self.peer_node:
+                        self.peer_node.broadcast_have(piece_index)
+                    break
+                print(f"[TransferEngine {self.peer_id}] DIRECT_UDP mảnh {piece_index} "
+                      f"thất bại, thử {attempt + 1}/3")
+            else:
+                print(f"[TransferEngine {self.peer_id}] DIRECT_UDP bị đứt; chuyển RELAY")
+                return False
+        return self.piece_manager.is_complete()
+
+    def _auto_worker_loop(self) -> None:
+        """Thử direct TCP, direct UDP (100 giây), rồi relay theo từng kết nối."""
+        while self.is_running and not self.piece_manager.is_complete():
+            peers = self._announce_to_tracker()
+            if peers:
+                break
+            time.sleep(2.0)
+        if not self.is_running or self.piece_manager.is_complete():
+            return
+
+        for peer in peers:
+            if not self.is_running:
+                return
+            peer_id, ip, port = peer.get("peer_id"), peer.get("ip"), peer.get("port")
+            if not (isinstance(peer_id, str) and isinstance(ip, str)
+                    and isinstance(port, int) and 1 <= port <= 65535):
+                continue
+            sock = self._connect_and_handshake(ip, port)
+            if sock and self._download_tcp_session(sock, peer_id, "DIRECT_TCP"):
+                return
+
+        if self.nat_info and self.signal_channel and self.signal_channel.is_connected:
+            udp_peer = self._find_udp_peer(peers)
+            if udp_peer and self._download_udp_session(udp_peer):
+                return
+        else:
+            print(f"[TransferEngine {self.peer_id}] Không có đường UDP; chuyển RELAY")
+
+        no_progress = 0
+        while self.is_running and not self.piece_manager.is_complete() and no_progress < 10:
+            before = self.piece_manager.completed_pieces_count()
+            peers = self._announce_to_tracker()
+            for peer in peers:
+                peer_id = peer.get("peer_id")
+                if not isinstance(peer_id, str):
+                    continue
+                try:
+                    self.current_path = "RELAY"
+                    sock = open_relay(self.tracker_host, self.tracker_port,
+                                      self.peer_id, peer_id, self.info_hash,
+                                      on_socket=lambda connected: setattr(self, "_auto_sock", connected))
+                    if not self.is_running:
+                        sock.close()
+                        return
+                    if not self._handshake_existing_socket(sock):
+                        sock.close()
+                        raise ConnectionError("Handshake qua relay thất bại")
+                    if self._download_tcp_session(sock, peer_id, "RELAY"):
+                        return
+                except (OSError, ConnectionError, PermissionError) as exc:
+                    print(f"[TransferEngine {self.peer_id}] RELAY tới {peer_id} lỗi: {exc}")
+                finally:
+                    if self._auto_sock is not None and self._auto_sock.fileno() == -1:
+                        self._auto_sock = None
+            after = self.piece_manager.completed_pieces_count()
+            no_progress = 0 if after > before else no_progress + 1
+            if not self.piece_manager.is_complete():
+                time.sleep(2.0)
+        if not self.piece_manager.is_complete():
+            print(f"[TransferEngine {self.peer_id}] Không tải được qua RELAY sau 10 lượt")
+            self.is_running = False
 
     def _worker_loop(self, worker_id: int) -> None:
         """Vòng lặp làm việc của Worker Thread: Chọn mảnh hiếm nhất và xin dữ liệu từ Peer."""
@@ -449,6 +621,12 @@ class TransferEngine:
     def stop(self) -> None:
         self.is_running = False
         self._announce_stop.set()
+        if self._auto_sock is not None:
+            try:
+                self._auto_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self._auto_sock.close()
         if self._announce_thread and self._announce_thread is not threading.current_thread():
             self._announce_thread.join()
         with self.lock:
@@ -458,3 +636,6 @@ class TransferEngine:
                 except Exception:
                     pass
             self.connected_peers.clear()
+        for thread in self._worker_threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=2.0)

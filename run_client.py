@@ -5,13 +5,12 @@ Cách chạy:
     python run_client.py                        # localhost, cổng 6881
     python run_client.py 6882                   # cổng tùy chọn
     python run_client.py 6881 192.168.1.10      # qua mạng LAN
-    python run_client.py 6881 100.108.79.47 --advertise-ip 100.108.79.47
-                                                # qua Tailscale
+    python run_client.py 6881 203.0.113.10 --transport auto  # tracker/relay trên VPS
 """
 import argparse
 import ipaddress
 import os
-import random
+import secrets
 from peer.client import P2PClient
 
 # ── Cấu hình ──
@@ -34,7 +33,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="P2P client chia sẻ file")
     parser.add_argument("listen_port", nargs="?", type=int, default=6881)
     parser.add_argument("tracker_host", nargs="?", default="127.0.0.1",
-                        help="Địa chỉ Tracker (có thể là IP hoặc host:port, VD: 0.tcp.ap.ngrok.io:12345)")
+                        help="Địa chỉ Tracker/Relay (IPv4 hoặc host:port trên VPS)")
     parser.add_argument(
         "--tracker-port",
         type=int,
@@ -44,10 +43,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--advertise-ip",
         type=ipv4_address,
-        help="IPv4 báo cho tracker (ví dụ IP Tailscale); mặc định dùng IP LAN",
+        help="IPv4 TCP có thể truy cập trực tiếp; mặc định dùng IP LAN",
     )
-    parser.add_argument("--transport", choices=("tcp", "udp"), default="tcp",
-                        help="tcp: Tailscale/LAN hiện tại; udp: thử trực tiếp qua NAT")
+    parser.add_argument("--transport", choices=("auto", "tcp", "udp"), default="auto",
+                        help="auto: TCP/UDP trực tiếp rồi relay; tcp/udp: chỉ thử đường trực tiếp")
     args = parser.parse_args(argv)
     if not 1 <= args.listen_port <= 65535:
         parser.error("listen_port phải nằm trong khoảng 1–65535")
@@ -81,7 +80,7 @@ def print_menu(peer_id: str, listen_port: int, tracker_host: str, tracker_port: 
 
 def main() -> None:
     args = parse_args()
-    peer_id = f"peer_{random.randint(1000, 9999)}"
+    peer_id = f"peer_{secrets.token_hex(8)}"
 
     client = P2PClient(
         peer_id=peer_id,

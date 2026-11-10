@@ -29,7 +29,7 @@ def _free_udp_port() -> int:
 
 class TestHolePunch(unittest.TestCase):
 
-    def test_parallel_workers_send_one_punch_request(self):
+    def test_tcp_workers_do_not_assume_udp_punch_opens_tcp(self):
         pm = SimpleNamespace(metainfo={"info_hash": "sample"}, target_file_path="/tmp/sample")
         signal = SimpleNamespace(is_connected=True, request_punch=Mock(return_value=True))
         engine = TransferEngine("leecher", "127.0.0.1", 8000, 6882, pm,
@@ -40,7 +40,7 @@ class TestHolePunch(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(lambda _: engine._update_peer_connections([peer]), range(4)))
             engine._update_peer_connections([peer])
-        signal.request_punch.assert_called_once_with("seeder")
+        signal.request_punch.assert_not_called()
 
     def test_duplicate_punch_signals_start_one_worker(self):
         client = P2PClient(peer_id="seeder", advertise_ip="127.0.0.1")

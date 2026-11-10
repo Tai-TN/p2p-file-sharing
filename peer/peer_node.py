@@ -40,9 +40,11 @@ class PeerNode:
 
         self.server_socket: Optional[socket.socket] = None
         self.is_running = False
+        self._accept_thread: Optional[threading.Thread] = None
+        self._handler_threads: set[threading.Thread] = set()
 
         # Danh sách socket đang kết nối đến từ Peer khác: { addr: socket }
-        self._active_sockets: Dict[Tuple[str, int], socket.socket] = {}
+        self._active_sockets: Dict[int, socket.socket] = {}
         self._sock_lock = threading.Lock()
 
     # ── Quản lý file ──────────────────────────────────────────────────── #
@@ -72,30 +74,40 @@ class PeerNode:
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(64)
+        self.server_socket.settimeout(1.0)
         self.is_running = True
 
         print(f"[PeerNode {self.peer_id}] Lắng nghe tại {self.host}:{self.port}")
 
-        t = threading.Thread(target=self._accept_loop, daemon=True)
-        t.start()
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
 
     def stop(self) -> None:
         """Đóng tất cả kết nối và server socket."""
         self.is_running = False
 
         with self._sock_lock:
-            for sock in self._active_sockets.values():
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+            sockets = list(self._active_sockets.values())
+            threads = list(self._handler_threads)
             self._active_sockets.clear()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
 
         if self.server_socket:
             try:
                 self.server_socket.close()
             except Exception:
                 pass
+
+        if self._accept_thread and self._accept_thread is not threading.current_thread():
+            self._accept_thread.join(timeout=2.0)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=2.0)
 
         print(f"[PeerNode {self.peer_id}] Đã dừng.")
 
@@ -106,12 +118,9 @@ class PeerNode:
         while self.is_running:
             try:
                 conn, addr = self.server_socket.accept()
-                t = threading.Thread(
-                    target=self._handle_peer_connection,
-                    args=(conn, addr),
-                    daemon=True,
-                )
-                t.start()
+                self.serve_socket(conn, addr)
+            except socket.timeout:
+                continue
             except OSError:
                 break  # server_socket đã bị đóng (do stop())
             except Exception:
@@ -119,6 +128,17 @@ class PeerNode:
                     break
 
     # ── Xử lý từng kết nối Peer ─────────────────────────────────────── #
+
+    def serve_socket(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        """Phục vụ cả socket direct inbound và socket outbound đã ghép relay."""
+        if not self.is_running:
+            conn.close()
+            return
+        thread = threading.Thread(target=self._handle_peer_connection, args=(conn, addr),
+                                  daemon=True)
+        with self._sock_lock:
+            self._handler_threads.add(thread)
+        thread.start()
 
     def _handle_peer_connection(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
         """
@@ -129,8 +149,15 @@ class PeerNode:
         """
         conn.settimeout(180.0)  # Tự đóng nếu Peer ngắt kết nối hoặc im lặng quá 60 giây
 
+        if not self.is_running:
+            conn.close()
+            with self._sock_lock:
+                self._handler_threads.discard(threading.current_thread())
+            return
+
+        key = id(conn)
         with self._sock_lock:
-            self._active_sockets[addr] = conn
+            self._active_sockets[key] = conn
 
         try:
             # Bước 1: Nhận HANDSHAKE
@@ -179,7 +206,8 @@ class PeerNode:
             pass
         finally:
             with self._sock_lock:
-                self._active_sockets.pop(addr, None)
+                self._active_sockets.pop(key, None)
+                self._handler_threads.discard(threading.current_thread())
             try:
                 conn.close()
             except Exception:

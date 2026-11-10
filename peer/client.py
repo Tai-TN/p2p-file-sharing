@@ -1,6 +1,6 @@
 import os
 import socket
-import random
+import secrets
 import threading
 import time
 from typing import Dict, List, Optional
@@ -13,6 +13,7 @@ from nat.stun_client import STUNClient, NATInfo, NATType
 from nat.signaling import TrackerSignalChannel
 from nat.hole_punch import HolePunchManager
 from nat.udp_transfer import UDPTransfer
+from nat.relay import join_relay
 
 
 def get_local_ip() -> str:
@@ -36,11 +37,11 @@ class P2PClient:
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
                  tracker_host: str = "127.0.0.1", tracker_port: int = 8000,
-                 advertise_ip: Optional[str] = None, transport: str = "tcp"):
-        if transport not in ("tcp", "udp"):
-            raise ValueError("transport phải là tcp hoặc udp")
+                 advertise_ip: Optional[str] = None, transport: str = "auto"):
+        if transport not in ("auto", "tcp", "udp"):
+            raise ValueError("transport phải là auto, tcp hoặc udp")
         self.transport = transport
-        self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
+        self.peer_id = peer_id or f"peer_{secrets.token_hex(8)}"
         self.listen_port = listen_port
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
@@ -61,7 +62,7 @@ class P2PClient:
         self._hole_punch_mgr = HolePunchManager(my_peer_id=self.peer_id, local_port=listen_port)
         self._udp_transfer = (UDPTransfer(self._hole_punch_mgr,
                                           self.node.get_piece_manager)
-                              if transport == "udp" else None)
+                              if transport in ("auto", "udp") else None)
         self.udp_candidates: List[Dict] = []
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
@@ -69,11 +70,20 @@ class P2PClient:
         self._lock = threading.Lock()
         self._punch_active: set[str] = set()
         self._next_punch_signal: Dict[str, float] = {}
+        self._relay_active: set[str] = set()
+        self._relay_workers: set[threading.Thread] = set()
+        self._relay_pending_sockets: set[socket.socket] = set()
+        self._stopping = threading.Event()
 
 
     def start(self) -> None:
         """Mở cổng TCP, chạy STUN để lấy public endpoint, rồi bắt đầu lắng nghe."""
         self.node.start_listening()
+        # Cổng 0 trong test chọn cổng TCP tự động; dùng cổng thực cho ANNOUNCE/STUN.
+        if self.listen_port == 0 and self.node.server_socket is not None:
+            self.listen_port = self.node.server_socket.getsockname()[1]
+            self._hole_punch_mgr.local_port = self.listen_port
+            self._hole_punch_mgr.puncher.local_port = self.listen_port
 
         # Chạy STUN nhanh (quick mode) để lấy public IP:UDP_port
         # Không block lâu: dùng get_public_endpoint() thay vì get_nat_info() đầy đủ
@@ -85,7 +95,7 @@ class P2PClient:
             udp_sock.bind(("0.0.0.0", self.listen_port))
             self.nat_info = stun.get_public_endpoint(udp_sock)
             if self.nat_info:
-                if self.transport == "udp":
+                if self.transport in ("auto", "udp"):
                     self.udp_candidates = stun.gather_candidates(udp_sock, self.nat_info)
                     print(f"[P2PClient {self.peer_id}] Ứng viên UDP: {self.udp_candidates}")
                     mappings = {(c["ip"], c["port"]) for c in self.udp_candidates
@@ -103,6 +113,7 @@ class P2PClient:
                 udp_sock.close()
 
         if self.transport == "udp" and self.nat_info is None:
+            self.node.stop()
             raise RuntimeError("Chế độ UDP cần STUN hoạt động để lấy địa chỉ ứng viên")
 
         print(f"[P2PClient {self.peer_id}] Đã khởi động")
@@ -114,39 +125,42 @@ class P2PClient:
             print(f"  Public IP  : (không lấy được — STUN thất bại)")
         print(f"  Tracker    : {self.tracker_host}:{self.tracker_port}")
 
-        # Mở signal channel với Tracker (chỉ khi có STUN info)
-        if self.nat_info:
-            self._signal_channel = TrackerSignalChannel(
-                tracker_host=self.tracker_host,
-                tracker_port=self.tracker_port,
-                peer_id=self.peer_id,
-                ip=self.nat_info.public_ip,
-                udp_port=self.nat_info.public_port,
-                tcp_port=self.listen_port,
-                candidates=self.udp_candidates,
-            )
-            self._signal_channel.on_punch_signal = self._on_punch_signal
-            self._signal_channel.on_punch_failed  = self._on_punch_failed
-            if self._signal_channel.start():
-                print(f"[P2PClient {self.peer_id}] Signal channel: sẵn sàng")
-            else:
-                print(f"[P2PClient {self.peer_id}] Signal channel: không kết nối được "
-                      f"(Tracker chưa hỗ trợ hoặc chưa online)")
-                self._signal_channel = None
+        # Relay cần signaling ngay cả khi UDP/STUN bị chặn.
+        self._signal_channel = TrackerSignalChannel(
+            tracker_host=self.tracker_host,
+            tracker_port=self.tracker_port,
+            peer_id=self.peer_id,
+            ip=self.nat_info.public_ip if self.nat_info else self.my_ip,
+            udp_port=self.nat_info.public_port if self.nat_info else 0,
+            tcp_port=self.listen_port,
+            candidates=self.udp_candidates,
+        )
+        self._signal_channel.on_punch_signal = self._on_punch_signal
+        self._signal_channel.on_punch_failed = self._on_punch_failed
+        self._signal_channel.on_relay_invite = self._on_relay_invite
+        if self._signal_channel.start():
+            print(f"[P2PClient {self.peer_id}] Signal channel: sẵn sàng")
+        else:
+            print(f"[P2PClient {self.peer_id}] Signal channel: đang thử kết nối lại")
 
     def stop(self) -> None:
         """Dừng tất cả engine, hủy đăng ký với Tracker, đóng kết nối."""
+        self._stopping.set()
         with self._lock:
             snapshot = list(self._tasks.values())
 
         for task in snapshot:
-            engine: TransferEngine = task["engine"]
             try:
-                engine.stop()
+                task["engine"].stop()
             except Exception:
                 pass
+        for task in snapshot:
+            thread = task.get("thread")
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+        for task in snapshot:
             try:
-                engine._announce_to_tracker(event="stopped")
+                task["engine"]._announce_to_tracker(event="stopped")
             except Exception:
                 pass
 
@@ -161,7 +175,20 @@ class P2PClient:
         if self._udp_transfer:
             self._udp_transfer.close()
         self._hole_punch_mgr.close()
+        with self._lock:
+            pending = list(self._relay_pending_sockets)
+        for sock in pending:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
         self.node.stop()
+        with self._lock:
+            workers = list(self._relay_workers)
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=1.0)
         print("[P2PClient] Đã dừng hoàn toàn.")
 
     # ── NAT traversal callbacks ───────────────────────────────────────────── #
@@ -192,19 +219,7 @@ class P2PClient:
                     print(f"[P2PClient {self.peer_id}] Đường UDP trực tiếp tới {peer_id} "
                           f"đã xác nhận: {self._hole_punch_mgr.get_endpoint(peer_id)}")
 
-                # 2. Thử kết nối TCP từ các engine đang tải
-                if self.transport == "udp":
-                    return
-                with self._lock:
-                    engines = [t["engine"] for t in self._tasks.values() if "engine" in t]
-                for eng in engines:
-                    if not eng.piece_manager.is_complete():
-                        eng._update_peer_connections([{
-                            "peer_id": peer_id,
-                            "ip": ip,
-                            "port": tcp_port,
-                            "udp_port": udp_port,
-                        }])
+                # UDP hole punching không mở cổng TCP tương ứng.
             finally:
                 with self._lock:
                     self._punch_active.discard(peer_id)
@@ -215,6 +230,51 @@ class P2PClient:
     def _on_punch_failed(self, reason: str) -> None:
         """Callback khi Tracker báo hole punch thất bại."""
         print(f"[P2PClient {self.peer_id}] PUNCH_FAILED: {reason}")
+
+    def _on_relay_invite(self, msg: dict) -> None:
+        session_id = msg.get("session_id")
+        token = msg.get("join_token")
+        info_hash = msg.get("info_hash")
+        if (self._stopping.is_set() or not isinstance(session_id, str)
+                or not isinstance(token, str) or not isinstance(info_hash, str)
+                or self.node.get_piece_manager(info_hash) is None):
+            return
+        with self._lock:
+            if session_id in self._relay_active:
+                return
+            self._relay_active.add(session_id)
+
+        def worker():
+            pending_sock = None
+            def remember(sock):
+                nonlocal pending_sock
+                pending_sock = sock
+                with self._lock:
+                    self._relay_pending_sockets.add(sock)
+            try:
+                sock = join_relay(self.tracker_host, self.tracker_port,
+                                  self.peer_id, session_id, token, on_socket=remember)
+                with self._lock:
+                    self._relay_pending_sockets.discard(sock)
+                if self._stopping.is_set():
+                    sock.close()
+                    return
+                print(f"[P2PClient {self.peer_id}] RELAY tới {msg.get('peer_id')} sẵn sàng")
+                self.node.serve_socket(sock, (self.tracker_host, self.tracker_port))
+            except Exception as exc:
+                if not self._stopping.is_set():
+                    print(f"[P2PClient {self.peer_id}] Không vào được relay: {exc}")
+            finally:
+                with self._lock:
+                    if pending_sock is not None:
+                        self._relay_pending_sockets.discard(pending_sock)
+                    self._relay_active.discard(session_id)
+                    self._relay_workers.discard(threading.current_thread())
+
+        thread = threading.Thread(target=worker, daemon=True, name=f"relay-{session_id[:8]}")
+        with self._lock:
+            self._relay_workers.add(thread)
+        thread.start()
 
     # ── Chia sẻ file (Seeder)
 
@@ -344,6 +404,8 @@ class P2PClient:
             args=(info_hash, engine),
             daemon=True,
         )
+        with self._lock:
+            self._tasks[info_hash]["thread"] = t
         t.start()
 
         print(f"[P2PClient] Đã khởi động tải ngầm: {file_name}")
@@ -374,7 +436,9 @@ class P2PClient:
                 result.append({
                     "name": task["name"],
                     "type": task["type"],
-                    "status": task["status"],
+                    "status": (f"{task['status']} [{task['engine'].current_path}]"
+                               if task["type"] == "Download" and task["engine"].current_path
+                               else task["status"]),
                     "progress": f"{pm.progress_percentage():.1f}%",
                     "pieces": f"{pm.completed_pieces_count()}/{pm.num_pieces}",
                     "info_hash": info_hash[:12] + "...",

@@ -8,6 +8,10 @@
 > tiếp bằng nhiều ứng viên UDP và dùng chính UDP để truyền mảnh khi probe/ACK thành
 > công. Cách chạy và giới hạn thực tế ở `docs/KE_HOACH_P2P_INTERNET.md`.
 
+> **Cập nhật 07/11/2026:** Đã thêm chế độ `auto` và relay TCP trên tracker cho
+> trường hợp đường trực tiếp thất bại. Xem `docs/TRIEN_KHAI_VPS.md` để triển khai.
+> Nội dung kế hoạch cũ phía dưới không mô tả chính xác giao thức đang chạy.
+
 ---
 
 ## 1. Tailscale làm NAT traversal thế nào?

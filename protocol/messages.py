@@ -5,6 +5,9 @@ from enum import Enum
 from typing import Dict, Any, Optional
 
 class MessageType(str, Enum):
+    AUTH_CHALLENGE = "AUTH_CHALLENGE"
+    AUTH_RESPONSE = "AUTH_RESPONSE"
+    AUTH_OK = "AUTH_OK"
     # Tracker Messages
     ANNOUNCE = "ANNOUNCE"
     ANNOUNCE_RESPONSE = "ANNOUNCE_RESPONSE"
@@ -17,6 +20,11 @@ class MessageType(str, Enum):
     PUNCH_REQUEST   = "PUNCH_REQUEST"    # Peer A yêu cầu Tracker báo cho Peer B punch
     PUNCH_SIGNAL    = "PUNCH_SIGNAL"     # Tracker gửi thông tin endpoint để peer bắt đầu punch
     PUNCH_FAILED    = "PUNCH_FAILED"     # Target peer không online hoặc không hỗ trợ hole punch
+    RELAY_OPEN      = "RELAY_OPEN"
+    RELAY_INVITE    = "RELAY_INVITE"
+    RELAY_JOIN      = "RELAY_JOIN"
+    RELAY_READY     = "RELAY_READY"
+    RELAY_ERROR     = "RELAY_ERROR"
 
     # Peer-to-Peer Messages
     HANDSHAKE = "HANDSHAKE"

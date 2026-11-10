@@ -2,6 +2,11 @@
 
 Tài liệu này giải thích chi tiết kiến trúc hệ thống, danh sách tất cả các hàm đã code, tham số đầu vào, kết quả đầu ra, luồng chạy thực tế và logic chi tiết từng dòng code của dự án chia sẻ file ngang hàng (P2P File Sharing).
 
+> Cập nhật: sơ đồ và phần mô tả bên dưới tập trung vào luồng TCP trực tiếp cũ.
+> Chế độ mặc định hiện là `auto`: thử TCP trực tiếp, UDP hole punching, rồi relay
+> TCP trên tracker. Hướng dẫn chạy trên VPS và giới hạn ở
+> [TRIEN_KHAI_VPS.md](TRIEN_KHAI_VPS.md).
+
 ---
 
 ## TỔNG QUAN KIẾN TRÚC MẠNG P2P
