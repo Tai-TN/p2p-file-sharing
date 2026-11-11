@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>P2P Share</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand" data-icon="share" data-icon-class="lg"><span>P2P Share</span></div>
+    <div class="status-line"><span class="dot wait" id="tracker-dot"></span><span id="status-text">Đang khởi động…</span></div>
+  </header>
+
+  <div class="body">
+    <nav class="sidebar" aria-label="Điều hướng">
+      <button class="nav-item active" data-view="files" data-icon="files"><span class="label">File của tôi</span></button>
+      <button class="nav-item" data-view="share" data-icon="upload"><span class="label">Chia sẻ file</span></button>
+      <button class="nav-item" data-view="download" data-icon="download"><span class="label">Tải file</span></button>
+      <button class="nav-item" data-view="settings" data-icon="settings"><span class="label">Cài đặt</span></button>
+      <button class="nav-item" data-view="logs" data-icon="terminal"><span class="label">Nhật ký</span></button>
+      <div class="sidebar-foot">
+        <div class="down" data-icon="down"><span id="total-down">0 B/s</span></div>
+        <div class="up" data-icon="up"><span id="total-up">0 B/s</span></div>
+      </div>
+    </nav>
+
+    <main class="main">
+      <div id="global-notice"></div>
+
+      <!-- ── File của tôi ── -->
+      <section class="view active" id="view-files">
+        <div class="view-head">
+          <h1>File của tôi</h1>
+          <div class="actions">
+            <button class="btn primary" data-goto="share" data-icon="upload">Chia sẻ file</button>
+            <button class="btn" data-goto="download" data-icon="download">Tải từ .meta.json</button>
+          </div>
+        </div>
+        <div id="files-list"></div>
+        <div id="file-detail" class="mt"></div>
+      </section>
+
+      <!-- ── Chia sẻ file ── -->
+      <section class="view" id="view-share">
+        <div class="view-head"><h1>Chia sẻ file</h1></div>
+        <div class="drop" id="share-drop">
+          <span data-icon="cloud" data-icon-class="lg"></span>
+          <p>Kéo thả file vào đây hoặc</p>
+          <button class="btn primary" id="btn-pick-share" data-icon="folder">Chọn file…</button>
+        </div>
+        <div id="share-jobs" class="mt"></div>
+      </section>
+
+      <!-- ── Tải file ── -->
+      <section class="view" id="view-download">
+        <div class="view-head"><h1>Tải file</h1></div>
+        <div class="drop" id="download-drop">
+          <span data-icon="download" data-icon-class="lg"></span>
+          <p>Kéo thả file .meta.json vào đây hoặc</p>
+          <button class="btn" id="btn-pick-meta" data-icon="folder">Chọn file .meta.json…</button>
+        </div>
+        <div id="download-preview" class="mt"></div>
+      </section>
+
+      <!-- ── Cài đặt ── -->
+      <section class="view" id="view-settings">
+        <div id="settings-main">
+          <div class="view-head"><h1>Cài đặt</h1></div>
+          <div class="group">
+            <h3>Kết nối</h3>
+            <div class="field">
+              <label for="s-tracker-host">Địa chỉ tracker</label>
+              <div class="row-flex">
+                <input class="input grow" id="s-tracker-host" placeholder="192.168.1.15">
+                <input class="input" id="s-tracker-port" style="width:80px" placeholder="8000">
+                <button class="btn sm" id="btn-test-tracker">Kiểm tra</button>
+              </div>
+            </div>
+            <div class="field"><label></label><div class="small" id="tracker-test-result"></div></div>
+            <div class="field">
+              <label for="s-listen-port">Cổng lắng nghe</label>
+              <div class="row-flex"><input class="input" id="s-listen-port" style="width:100px"><span class="hint">Mỗi app trên cùng máy cần một cổng khác nhau.</span></div>
+            </div>
+            <div class="field">
+              <label for="s-peer-name">Tên peer</label>
+              <input class="input" id="s-peer-name" style="width:200px">
+            </div>
+          </div>
+          <div class="group">
+            <h3>Thư mục</h3>
+            <div class="field">
+              <label>Lưu file tải về</label>
+              <div class="row-flex"><input class="input grow" id="s-download-dir" readonly><button class="btn sm" data-pick-dir="s-download-dir">Đổi…</button></div>
+            </div>
+            <div class="field">
+              <label>Lưu file .meta.json</label>
+              <div class="row-flex"><input class="input grow" id="s-meta-dir" readonly><button class="btn sm" data-pick-dir="s-meta-dir">Đổi…</button></div>
+            </div>
+          </div>
+          <button class="nav-row" id="btn-advanced"><span><strong>Cài đặt nâng cao</strong><br><span class="small muted">Số luồng tải, slot tit-for-tat, tự tải tiếp khi mở app</span></span><span data-icon="right"></span></button>
+        </div>
+
+        <div id="settings-advanced" class="hidden">
+          <button class="link back" id="btn-back-settings" data-icon="left">Cài đặt</button>
+          <div class="view-head"><h1>Cài đặt nâng cao</h1></div>
+          <div class="group">
+            <h3>Tải xuống</h3>
+            <div class="field">
+              <label for="s-max-workers">Số luồng tải song song</label>
+              <div class="row-flex"><input class="input" id="s-max-workers" type="number" min="1" max="16" style="width:80px"><span class="hint">1–16, mặc định 4</span></div>
+            </div>
+          </div>
+          <div class="group">
+            <h3>Tit-for-tat</h3>
+            <p class="help">Quyết định peer nào được tải từ máy bạn. Peer gửi cho bạn nhiều nhất được ưu tiên.</p>
+            <div class="field">
+              <label for="s-regular-slots">Slot upload thường</label>
+              <div class="row-flex"><input class="input" id="s-regular-slots" type="number" min="0" max="10" style="width:80px"><span class="hint">mặc định 2</span></div>
+            </div>
+            <div class="field">
+              <label for="s-optimistic-slots">Slot optimistic</label>
+              <div class="row-flex"><input class="input" id="s-optimistic-slots" type="number" min="0" max="5" style="width:80px"><span class="hint">cho peer mới cơ hội thử, mặc định 1</span></div>
+            </div>
+            <div class="field">
+              <label for="s-choking-interval">Chu kỳ xét lại (giây)</label>
+              <div class="row-flex"><input class="input" id="s-choking-interval" type="number" min="5" max="300" style="width:80px"><span class="hint">mặc định 20</span></div>
+            </div>
+          </div>
+          <div class="group">
+            <h3>Khi mở app</h3>
+            <label class="check"><input type="checkbox" id="s-auto-resume"> <span>Tự tải tiếp và chia sẻ lại các file đang có trong danh sách</span></label>
+          </div>
+        </div>
+
+        <div class="save-bar">
+          <span class="tiny muted" id="settings-hint">Đổi cổng, tracker, tên peer hoặc cài đặt nâng cao cần khởi động lại app.</span>
+          <button class="btn primary" id="btn-save-settings">Lưu cài đặt</button>
+        </div>
+        <div class="field-error" id="settings-error"></div>
+      </section>
+
+      <!-- ── Nhật ký ── -->
+      <section class="view" id="view-logs">
+        <div class="view-head">
+          <h1>Nhật ký</h1>
+          <div class="actions">
+            <input class="input" id="log-search" placeholder="Tìm trong nhật ký" style="width:180px">
+            <select class="input" id="log-level">
+              <option value="">Tất cả</option>
+              <option value="INFO">INFO</option>
+              <option value="OK">OK</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+            <button class="btn sm" id="btn-clear-logs" data-icon="trash">Xóa</button>
+          </div>
+        </div>
+        <div class="log" id="log-box"></div>
+      </section>
+    </main>
+  </div>
+</div>
+<script src="common.js"></script>
+<script src="peer.js"></script>
+</body>
+</html>

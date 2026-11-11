@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>P2P Tracker</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand" data-icon="server" data-icon-class="lg"><span>P2P Tracker · Quản trị</span></div>
+    <div class="row-flex">
+      <div class="status-line"><span class="dot wait" id="run-dot"></span><span id="run-text">Đang khởi động…</span></div>
+      <div class="port-box hidden" id="port-box">
+        <label class="small sec" for="port-input">Cổng</label>
+        <input class="input" id="port-input" inputmode="numeric">
+      </div>
+      <button class="btn sm" id="btn-toggle"></button>
+    </div>
+  </header>
+
+  <main class="admin-main">
+    <div id="error-box"></div>
+    <div class="stats">
+      <div class="stat"><div class="k">File đang chia sẻ</div><div class="v big" id="m-swarms">0</div></div>
+      <div class="stat"><div class="k">Peer online</div><div class="v big" id="m-peers">0</div></div>
+      <div class="stat"><div class="k">Seeder / Leecher</div><div class="v big" id="m-roles">0 / 0</div></div>
+      <div class="stat"><div class="k">Peer bị báo lỗi</div><div class="v big" id="m-reported">0</div></div>
+    </div>
+
+    <div class="admin-grid">
+      <section class="panel">
+        <div class="panel-head"><h3>Swarm (theo file)</h3></div>
+        <div class="panel-body" id="swarm-list"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h3 id="peers-title">Peer</h3><span class="mono tiny muted" id="peers-hash"></span></div>
+        <div class="panel-body" id="peer-list"></div>
+      </section>
+    </div>
+
+    <div class="admin-grid">
+      <section class="panel">
+        <div class="panel-head"><h3>Danh sách chặn</h3></div>
+        <div class="panel-body" id="block-list"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h3>Hoạt động gần đây</h3></div>
+        <div class="events" id="events"></div>
+      </section>
+    </div>
+  </main>
+</div>
+<script src="common.js"></script>
+<script src="tracker.js"></script>
+</body>
+</html>
