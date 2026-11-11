@@ -1,6 +1,5 @@
 """
 nat/stun_client.py — STUN client theo RFC 5389.
-
 Chức năng:
 - Lấy public IP và UDP port của máy qua STUN server.
 - Phân loại NAT type (Full-Cone, Restricted-Cone, Port-Restricted, Symmetric, No NAT).
@@ -12,6 +11,15 @@ Cách dùng:
     result = client.get_nat_info()
     print(result)
     # => NATInfo(public_ip='1.2.3.4', public_port=12345, nat_type=NATType.FULL_CONE, local_port=54321)
+"""
+"""
+STUN (Session Traversal Utilities for NAT) là một giao thức giúp thiết bị xác định địa chỉ IP và Port 
+mà một STUN Server nhìn thấy khi thiết bị kết nối ra Internet.
+Quá trình diễn ra như sau:
+1. Máy tính gửi một gói UDP tới STUN Server.
+2. NAT thay đổi IP nguồn và có thể thay đổi Port nguồn.
+3. STUN Server nhận gói tin và quan sát IP:Port nguồn.
+4. Server trả thông tin đó về máy tính.
 """
 
 import os

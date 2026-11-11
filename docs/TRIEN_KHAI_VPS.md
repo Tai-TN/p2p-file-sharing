@@ -63,6 +63,14 @@ sau đó tự chuyển `RELAY`. `--transport tcp` và `--transport udp` dùng đ
 đường trực tiếp. `--advertise-ip` chỉ dùng khi có địa chỉ **TCP** thực sự truy cập
 được; không nhập public IP lấy từ STUN vào tham số này.
 
+Đường UDP mặc định tải tối đa bốn mảnh song song và mỗi mảnh có tối đa 48 gói
+1 KiB chờ ACK. Dùng `--udp-parallel 1..4` trên leecher và `--udp-window 16..128`
+trên seeder để so cấu hình; ví dụ thử mốc cũ là `--udp-parallel 1` ở leecher
+và `--udp-window 32` ở seeder. Seeder in `ACK`, `gửi_lại`, RTT trung bình và
+RTT cao theo từng mảnh. Leecher in tốc độ `DIRECT_UDP` tính từ byte đã kiểm tra
+SHA-256; tốc độ tổng còn bao gồm thời gian tìm đường. Để so công bằng, thử cùng
+một file từ 0% trên hai mạng Internet, lặp lại vài lần và so trung vị tốc độ.
+
 Xem log hoặc mục tiến độ để biết `DIRECT_TCP`, `DIRECT_UDP` hay `RELAY`. Dùng
 `sha256sum` trên file nguồn và file nhận để xác nhận nội dung trùng nhau. Khi thử
 Internet, tắt Tailscale trên cả hai máy và dùng hai mạng khác nhau. Để kiểm tra
@@ -74,5 +82,6 @@ VPS: log phải hiện `RELAY` và file nhận có SHA-256 trùng nguồn.
 - Nếu một peer không kết nối TCP outbound được tới VPS, relay cũng không hoạt động.
 - Bí mật chung và mã phiên giới hạn người dùng relay; chúng không mã hóa nội dung
   file. Chỉ chia sẻ file với các máy tin cậy trong bản này.
-- Đường `auto` hiện tải lần lượt từ từng peer; `tcp` giữ worker tải song song cũ.
+- Đường `auto` hiện chọn từng peer một; khi dùng UDP, nó tải nhiều mảnh từ peer
+  đã chọn. `tcp` giữ worker tải song song cũ.
 - Kiểm thử localhost xác nhận logic relay, không chứng minh kết nối qua hai NAT thật.

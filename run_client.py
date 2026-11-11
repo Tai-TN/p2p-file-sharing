@@ -47,9 +47,17 @@ def parse_args(argv=None):
     )
     parser.add_argument("--transport", choices=("auto", "tcp", "udp"), default="auto",
                         help="auto: TCP/UDP trực tiếp rồi relay; tcp/udp: chỉ thử đường trực tiếp")
+    parser.add_argument("--udp-parallel", type=int, default=4,
+                        help="Số mảnh UDP tải đồng thời (1–4, mặc định: 4)")
+    parser.add_argument("--udp-window", type=int, default=48,
+                        help="Số gói UDP chờ ACK mỗi mảnh (16–128, mặc định: 48)")
     args = parser.parse_args(argv)
     if not 1 <= args.listen_port <= 65535:
         parser.error("listen_port phải nằm trong khoảng 1–65535")
+    if not 1 <= args.udp_parallel <= 4:
+        parser.error("--udp-parallel phải trong khoảng 1–4")
+    if not 16 <= args.udp_window <= 128:
+        parser.error("--udp-window phải trong khoảng 16–128")
 
     # Hỗ trợ truyền tracker dạng host:port (tiện khi dùng ngrok TCP)
     tracker_port = TRACKER_PORT
@@ -89,6 +97,8 @@ def main() -> None:
         tracker_port=args.tracker_port,
         advertise_ip=args.advertise_ip,
         transport=args.transport,
+        udp_parallel=args.udp_parallel,
+        udp_window=args.udp_window,
     )
     client.start()
 

@@ -12,7 +12,7 @@ from peer.transfer_engine import TransferEngine
 from nat.stun_client import STUNClient, NATInfo, NATType
 from nat.signaling import TrackerSignalChannel
 from nat.hole_punch import HolePunchManager
-from nat.udp_transfer import UDPTransfer
+from nat.udp_transfer import MAX_WINDOW, MIN_WINDOW, UDPTransfer
 from nat.relay import join_relay
 
 
@@ -37,10 +37,16 @@ class P2PClient:
 
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
                  tracker_host: str = "127.0.0.1", tracker_port: int = 8000,
-                 advertise_ip: Optional[str] = None, transport: str = "auto"):
+                 advertise_ip: Optional[str] = None, transport: str = "auto",
+                 udp_parallel: int = 4, udp_window: int = 48):
         if transport not in ("auto", "tcp", "udp"):
             raise ValueError("transport phải là auto, tcp hoặc udp")
+        if not isinstance(udp_parallel, int) or not 1 <= udp_parallel <= 4:
+            raise ValueError("udp_parallel phải trong khoảng 1–4")
+        if not isinstance(udp_window, int) or not MIN_WINDOW <= udp_window <= MAX_WINDOW:
+            raise ValueError(f"udp_window phải trong khoảng {MIN_WINDOW}–{MAX_WINDOW}")
         self.transport = transport
+        self.udp_parallel = udp_parallel
         self.peer_id = peer_id or f"peer_{secrets.token_hex(8)}"
         self.listen_port = listen_port
         self.tracker_host = tracker_host
@@ -61,7 +67,7 @@ class P2PClient:
         # Trình quản lý đục lỗ NAT
         self._hole_punch_mgr = HolePunchManager(my_peer_id=self.peer_id, local_port=listen_port)
         self._udp_transfer = (UDPTransfer(self._hole_punch_mgr,
-                                          self.node.get_piece_manager)
+                                          self.node.get_piece_manager, window=udp_window)
                               if transport in ("auto", "udp") else None)
         self.udp_candidates: List[Dict] = []
 
@@ -330,6 +336,7 @@ class P2PClient:
             signal_channel=self._signal_channel,
             transport=self.transport,
             udp_transfer=self._udp_transfer,
+            udp_parallel=self.udp_parallel,
         )
         try:
             engine.start_announcing()
@@ -387,6 +394,7 @@ class P2PClient:
             signal_channel=self._signal_channel,
             transport=self.transport,
             udp_transfer=self._udp_transfer,
+            udp_parallel=self.udp_parallel,
         )
 
         with self._lock:

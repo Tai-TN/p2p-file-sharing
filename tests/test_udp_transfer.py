@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from nat.udp_transfer import UDPTransfer, HEADER, MAGIC, DATA, ACK
@@ -167,6 +168,8 @@ class TestUDPTransfer(unittest.TestCase):
             b._shared_socket.drop_ack_once = True
             upload = UDPTransfer(a, lambda key: seeder_pm if key == info_hash else None)
             download = UDPTransfer(b, lambda _: None)
+            stats = []
+            upload.on_upload_stats = stats.append
             try:
                 received = download.request_piece("seeder", info_hash, 0, len(data), timeout=5)
                 self.assertEqual(received, data)
@@ -177,12 +180,181 @@ class TestUDPTransfer(unittest.TestCase):
                 while upload._uploads and time.monotonic() < deadline:
                     time.sleep(0.05)
                 self.assertFalse(upload._uploads, "ACK cuối mất phải được xác nhận khi gói gửi lại")
+                self.assertEqual(len(stats), 1)
+                self.assertEqual(stats[0]["acked"], stats[0]["packets"])
+                self.assertGreaterEqual(stats[0]["retransmissions"], 2)
+                self.assertLess(stats[0]["rtt_samples"], stats[0]["acked"])
+                self.assertGreater(stats[0]["rtt_avg_ms"], 0)
                 with open(target, "rb") as handle:
                     self.assertEqual(hashlib.sha256(handle.read()).digest(),
                                      hashlib.sha256(data).digest())
             finally:
                 upload.close()
                 download.close()
+
+    def test_four_piece_requests_overlap_and_verify_sha256(self):
+        data = os.urandom(4 * 40_000)
+        info_hash = "ef" * 32
+        hashes = [hashlib.sha256(data[i:i + 40_000]).hexdigest()
+                  for i in range(0, len(data), 40_000)]
+        meta = {"info_hash": info_hash, "info": {
+            "name": "parallel.bin", "file_size": len(data),
+            "piece_length": 40_000, "pieces": hashes,
+        }}
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "source.bin")
+            target = os.path.join(folder, "target.bin")
+            with open(source, "wb") as handle:
+                handle.write(data)
+            seeder_pm = PieceManager(source, meta)
+            seeder_pm.verify_all_pieces()
+            leecher_pm = PieceManager(target, meta)
+            a = FakeManager(("127.0.0.1", 11011), ("127.0.0.1", 11012))
+            b = FakeManager(("127.0.0.1", 11012), ("127.0.0.1", 11011))
+            a._shared_socket.remote = b._shared_socket
+            b._shared_socket.remote = a._shared_socket
+            upload = UDPTransfer(a, lambda key: seeder_pm if key == info_hash else None,
+                                 window=48)
+            download = UDPTransfer(b, lambda _: None)
+            try:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(download.request_piece, "seeder", info_hash,
+                                           i, 40_000, 5) for i in range(4)]
+                    pieces = [future.result(timeout=7) for future in futures]
+                for i, piece in enumerate(pieces):
+                    self.assertIsNotNone(piece)
+                    self.assertTrue(leecher_pm.write_piece(i, piece))
+                with open(target, "rb") as handle:
+                    self.assertEqual(hashlib.sha256(handle.read()).digest(),
+                                     hashlib.sha256(data).digest())
+            finally:
+                upload.close()
+                download.close()
+
+    def test_upload_session_limit_stays_at_four(self):
+        class AvailablePiece:
+            num_pieces = 1
+
+            def has_piece(self, _index):
+                return True
+
+        manager = FakeManager(("127.0.0.1", 11021), ("127.0.0.1", 11022))
+        transfer = UDPTransfer(manager, lambda _hash: AvailablePiece())
+        try:
+            with patch("nat.udp_transfer.threading.Thread"):
+                for index in range(5):
+                    transfer._handle_request(index.to_bytes(8, "big"), 0,
+                                             b"a" * 32, manager.remote_address)
+            self.assertEqual(len(transfer._uploads), 4)
+        finally:
+            transfer.close()
+
+    def test_engine_limits_parallel_pieces_and_cancels_on_failure(self):
+        data = os.urandom(8 * 4096)
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "source.bin")
+            target = os.path.join(folder, "target.bin")
+            with open(source, "wb") as handle:
+                handle.write(data)
+            meta = create_metainfo(source, piece_length=4096)
+            pm = PieceManager(target, meta)
+
+            class FakeTransfer:
+                def __init__(self, fail=False):
+                    self.fail = fail
+                    self.lock = threading.Lock()
+                    self.active = 0
+                    self.maximum = 0
+                    self.calls = []
+                    self.barrier = threading.Barrier(4)
+
+                def request_piece(self, _peer, _hash, index, _length,
+                                  cancel_event=None):
+                    with self.lock:
+                        self.active += 1
+                        self.maximum = max(self.maximum, self.active)
+                        self.calls.append(index)
+                    try:
+                        if len(self.calls) <= 4:
+                            self.barrier.wait(timeout=2)
+                        if self.fail:
+                            while index != 0 and not cancel_event.is_set():
+                                time.sleep(0.01)
+                            return None
+                        time.sleep(0.01)
+                        return data[index * 4096:(index + 1) * 4096]
+                    finally:
+                        with self.lock:
+                            self.active -= 1
+
+            transfer = FakeTransfer()
+            engine = TransferEngine("leecher", "127.0.0.1", 8000, 6882, pm,
+                                    transport="auto", udp_transfer=transfer,
+                                    udp_parallel=4)
+            engine.is_running = True
+            engine.peer_node = None
+            self.assertTrue(engine._download_udp_session("seeder"))
+            self.assertEqual(transfer.maximum, 4)
+            self.assertEqual(sorted(transfer.calls), list(range(8)))
+            with open(target, "rb") as handle:
+                self.assertEqual(hashlib.sha256(handle.read()).digest(),
+                                 hashlib.sha256(data).digest())
+
+            failed = FakeTransfer(fail=True)
+            engine = TransferEngine("leecher", "127.0.0.1", 8000, 6882,
+                                    PieceManager(os.path.join(folder, "failed.bin"), meta),
+                                    transport="auto", udp_transfer=failed,
+                                    udp_parallel=4)
+            engine.is_running = True
+            engine.peer_node = None
+            self.assertFalse(engine._download_udp_session("seeder"))
+            self.assertTrue(engine._udp_session_cancel.is_set())
+            self.assertEqual(failed.calls.count(0), 3)
+            self.assertEqual(failed.active, 0)
+
+    def test_engine_stop_cancels_parallel_udp_requests(self):
+        data = os.urandom(4 * 4096)
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "source.bin")
+            with open(source, "wb") as handle:
+                handle.write(data)
+            pm = PieceManager(os.path.join(folder, "target.bin"),
+                              create_metainfo(source, piece_length=4096))
+
+            class WaitingTransfer:
+                def __init__(self):
+                    self.started = threading.Event()
+                    self.lock = threading.Lock()
+                    self.active = 0
+
+                def request_piece(self, _peer, _hash, _index, _length,
+                                  cancel_event=None):
+                    with self.lock:
+                        self.active += 1
+                        if self.active == 4:
+                            self.started.set()
+                    try:
+                        while not cancel_event.is_set():
+                            time.sleep(0.01)
+                        return None
+                    finally:
+                        with self.lock:
+                            self.active -= 1
+
+            transfer = WaitingTransfer()
+            engine = TransferEngine("leecher", "127.0.0.1", 8000, 6882, pm,
+                                    transport="udp", udp_transfer=transfer,
+                                    udp_parallel=4)
+            engine.is_running = True
+            engine.peer_node = None
+            worker = threading.Thread(target=engine._download_udp_session,
+                                      args=("seeder",))
+            worker.start()
+            self.assertTrue(transfer.started.wait(timeout=2))
+            engine.stop()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(transfer.active, 0)
 
     def test_resume_rechecks_disk_instead_of_trusting_progress_json(self):
         data = b"good data"

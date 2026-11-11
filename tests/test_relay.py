@@ -156,6 +156,48 @@ class RelayTests(unittest.TestCase):
                 leecher.stop()
                 seeder.stop()
 
+    def test_auto_relays_after_three_failed_udp_piece_requests(self):
+        data = os.urandom(40 * 1024)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "source.bin")
+            meta_path = os.path.join(temp_dir, "source.bin.meta.json")
+            with open(source, "wb") as handle:
+                handle.write(data)
+
+            def fake_stun(_client, udp_sock):
+                port = udp_sock.getsockname()[1]
+                return NATInfo("127.0.0.1", port, "127.0.0.1", port, NATType.OPEN)
+
+            with patch("peer.client.STUNClient.get_public_endpoint", autospec=True,
+                       side_effect=fake_stun), \
+                 patch("peer.client.STUNClient.gather_candidates", return_value=[]):
+                seeder = P2PClient("seeder-fallback", listen_port=0,
+                                   tracker_host="127.0.0.1", tracker_port=self.tracker.port)
+                leecher = P2PClient("leecher-fallback", listen_port=0,
+                                    tracker_host="127.0.0.1", tracker_port=self.tracker.port)
+                seeder.start()
+                leecher.start()
+            try:
+                info_hash = seeder.share_file(source, meta_path)
+                with patch.object(TransferEngine, "_connect_and_handshake", return_value=None), \
+                     patch.object(TransferEngine, "_find_udp_peer", return_value="seeder-fallback"), \
+                     patch.object(leecher._udp_transfer, "request_piece", return_value=None) as request:
+                    leecher.download_file(meta_path, os.path.join(temp_dir, "downloads"))
+                    deadline = time.monotonic() + 10.0
+                    while time.monotonic() < deadline:
+                        if leecher._tasks[info_hash]["pm"].is_complete():
+                            break
+                        time.sleep(0.05)
+                self.assertEqual(request.call_count, 3)
+                self.assertTrue(leecher._tasks[info_hash]["pm"].is_complete())
+                self.assertEqual(leecher._tasks[info_hash]["engine"].current_path, "RELAY")
+                with open(os.path.join(temp_dir, "downloads", "source.bin"), "rb") as handle:
+                    self.assertEqual(hashlib.sha256(handle.read()).digest(),
+                                     hashlib.sha256(data).digest())
+            finally:
+                leecher.stop()
+                seeder.stop()
+
     def test_auto_uses_direct_tcp_when_reachable(self):
         data = os.urandom(12 * 1024)
         with tempfile.TemporaryDirectory() as temp_dir:

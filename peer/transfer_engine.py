@@ -6,6 +6,7 @@ import base64
 import binascii
 import random
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Dict, List, Optional, Tuple, Any
 from storage.piece_manager import PieceManager
 from protocol.messages import (
@@ -36,7 +37,10 @@ class TransferEngine:
                  max_workers: int = 4, my_ip: str = "",
                  nat_info: Optional[NATInfo] = None,
                  signal_channel: Optional[Any] = None,
-                 transport: str = "tcp", udp_transfer: Optional[Any] = None):
+                 transport: str = "tcp", udp_transfer: Optional[Any] = None,
+                 udp_parallel: int = 4):
+        if not isinstance(udp_parallel, int) or not 1 <= udp_parallel <= 4:
+            raise ValueError("udp_parallel phải trong khoảng 1–4")
         self.peer_id = peer_id
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
@@ -52,6 +56,8 @@ class TransferEngine:
         self.signal_channel = signal_channel
         self.transport = transport
         self.udp_transfer = udp_transfer
+        self.udp_parallel = udp_parallel
+        self._udp_session_cancel = threading.Event()
 
         self.is_running = False
         self.lock = threading.Lock()
@@ -76,6 +82,10 @@ class TransferEngine:
         """Bắt đầu quá trình tải tập tin song song."""
         self.peer_node = peer_node
         self._load_progress() # Dùng load_progress tránh việc verify lại toàn bộ hash -> Lâu lắc
+        verified_before = sum(self.piece_manager._get_piece_bounds(i)[1]
+                              for i in range(self.piece_manager.num_pieces)
+                              if self.piece_manager.has_piece(i))
+        time_start = time.monotonic()
 
         print(f"[TransferEngine {self.peer_id}] Khởi động tải tập tin: {self.piece_manager.info['name']}")
 
@@ -95,8 +105,6 @@ class TransferEngine:
         self._worker_threads = worker_threads
 
 
-        time_start = time.time()
-
         # Chờ cho tới khi tải xong 100% hoặc bị dừng
         # Lưu progress mỗi 10 giây thay vì mỗi 0.5s — tránh ghi JSON lớn liên tục
         last_save = 0
@@ -109,14 +117,16 @@ class TransferEngine:
 
         if self.piece_manager.is_complete():
             print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%! Bắt đầu chuyển sang chế độ Seeder.")
-            elapsed   = time.time() - time_start
-            total_MB  = self.piece_manager.file_size / 1_048_576
-            speed_MBs = total_MB / elapsed if elapsed > 0 else 0
-            speed_Mbs = speed_MBs * 8
+            elapsed = time.monotonic() - time_start
+            new_bytes = self.piece_manager.file_size - verified_before
+            total_MiB = self.piece_manager.file_size / 1_048_576
+            speed_MiBs = new_bytes / 1_048_576 / elapsed if elapsed > 0 else 0
+            speed_Mbps = new_bytes * 8 / 1_000_000 / elapsed if elapsed > 0 else 0
             print(f"[TransferEngine {self.peer_id}] TẢI HOÀN TẤT 100%!")
             print(f"  Thời gian : {elapsed:.2f} giây")
-            print(f"  Kích thước: {total_MB:.2f} MB")
-            print(f"  Tốc độ TB : {speed_MBs:.2f} MB/s  ({speed_Mbs:.1f} Mbps)")
+            print(f"  Kích thước: {total_MiB:.2f} MiB")
+            print(f"  Đã tải lượt này: {new_bytes / 1_048_576:.2f} MiB")
+            print(f"  Tốc độ TB : {speed_MiBs:.2f} MiB/s  ({speed_Mbps:.1f} Mbps)")
             self._announce_to_tracker(event="completed")
             self._remove_progress_file()
             return True
@@ -283,23 +293,8 @@ class TransferEngine:
                 time.sleep(2.0)
 
         print(f"[TransferEngine {self.peer_id}] Tải UDP trực tiếp từ {seeder_id}")
-        self.current_path = "DIRECT_UDP"
-        for piece_index in self.piece_manager.missing_pieces():
-            if not self.is_running:
-                return
-            _, length = self.piece_manager._get_piece_bounds(piece_index)
-            for attempt in range(3):
-                data = self.udp_transfer.request_piece(
-                    seeder_id, self.info_hash, piece_index, length)
-                if data is not None and self.piece_manager.write_piece(piece_index, data):
-                    print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ DIRECT_UDP "
-                          f"({self.piece_manager.progress_percentage():.1f}%)")
-                    break
-                print(f"[TransferEngine {self.peer_id}] Mảnh {piece_index} "
-                      f"không nhận đủ/hợp lệ; thử lại {attempt + 1}/3")
-            else:
-                self.is_running = False
-                return
+        if not self._download_udp_session(seeder_id) and self.is_running:
+            self.is_running = False
 
     def _connect_and_handshake(self, ip: str, port: int) -> Optional[socket.socket]:
         """Thực hiện kết nối socket TCP và thực hiện Bắt tay (Handshake) với Peer khác."""
@@ -412,27 +407,72 @@ class TransferEngine:
         return None
 
     def _download_udp_session(self, peer_id: str) -> bool:
+        if self.udp_transfer is None:
+            return False
         self.current_path = "DIRECT_UDP"
-        print(f"[TransferEngine {self.peer_id}] Đường DIRECT_UDP tới {peer_id} sẵn sàng")
-        for piece_index in self.piece_manager.missing_pieces():
-            if not self.is_running:
-                return False
-            _, length = self.piece_manager._get_piece_bounds(piece_index)
-            for attempt in range(3):
-                data = self.udp_transfer.request_piece(peer_id, self.info_hash,
-                                                       piece_index, length)
-                if data is not None and self.piece_manager.write_piece(piece_index, data):
-                    print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ DIRECT_UDP "
-                          f"({self.piece_manager.progress_percentage():.1f}%)")
-                    if self.peer_node:
-                        self.peer_node.broadcast_have(piece_index)
+        print(f"[TransferEngine {self.peer_id}] Đường DIRECT_UDP tới {peer_id} sẵn sàng "
+              f"({self.udp_parallel} mảnh song song)")
+        missing = iter(self.piece_manager.missing_pieces())
+        started = time.monotonic()
+        verified_bytes = 0
+        failed = False
+        active = {}
+
+        with ThreadPoolExecutor(max_workers=self.udp_parallel,
+                                thread_name_prefix="udp-piece") as pool:
+            def submit(piece_index: int, attempt: int) -> None:
+                _, length = self.piece_manager._get_piece_bounds(piece_index)
+                future = pool.submit(self.udp_transfer.request_piece,
+                                     peer_id, self.info_hash, piece_index, length,
+                                     cancel_event=self._udp_session_cancel)
+                active[future] = (piece_index, attempt)
+
+            for _ in range(self.udp_parallel):
+                piece_index = next(missing, None)
+                if piece_index is None:
                     break
-                print(f"[TransferEngine {self.peer_id}] DIRECT_UDP mảnh {piece_index} "
-                      f"thất bại, thử {attempt + 1}/3")
-            else:
-                print(f"[TransferEngine {self.peer_id}] DIRECT_UDP bị đứt; chuyển RELAY")
-                return False
-        return self.piece_manager.is_complete()
+                submit(piece_index, 1)
+
+            while active and self.is_running and not self._udp_session_cancel.is_set():
+                done, _ = wait(active, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    piece_index, attempt = active.pop(future)
+                    try:
+                        data = future.result()
+                    except Exception as exc:
+                        print(f"[TransferEngine {self.peer_id}] DIRECT_UDP mảnh "
+                              f"{piece_index} lỗi: {exc}")
+                        data = None
+                    if not self.is_running or self._udp_session_cancel.is_set():
+                        break
+                    if data is not None and self.piece_manager.write_piece(piece_index, data):
+                        verified_bytes += len(data)
+                        print(f"[TransferEngine {self.peer_id}] Piece {piece_index} ✓ DIRECT_UDP "
+                              f"({self.piece_manager.progress_percentage():.1f}%)")
+                        if self.peer_node:
+                            self.peer_node.broadcast_have(piece_index)
+                        next_piece = next(missing, None)
+                        if next_piece is not None:
+                            submit(next_piece, 1)
+                    elif attempt < 3:
+                        print(f"[TransferEngine {self.peer_id}] DIRECT_UDP mảnh "
+                              f"{piece_index} thất bại, thử {attempt}/3")
+                        submit(piece_index, attempt + 1)
+                    else:
+                        print(f"[TransferEngine {self.peer_id}] DIRECT_UDP mảnh "
+                              f"{piece_index} thất bại 3 lần; dừng UDP")
+                        failed = True
+                        self._udp_session_cancel.set()
+                        break
+
+        elapsed = time.monotonic() - started
+        rate = verified_bytes * 8 / 1_000_000 / elapsed if elapsed > 0 else 0
+        print(f"[TransferEngine {self.peer_id}] DIRECT_UDP đã xác minh "
+              f"{verified_bytes / 1_048_576:.2f} MiB trong {elapsed:.2f} giây "
+              f"({rate:.1f} Mbps)")
+        if failed and self.transport == "auto":
+            print(f"[TransferEngine {self.peer_id}] DIRECT_UDP bị đứt; chuyển RELAY")
+        return not failed and self.is_running and self.piece_manager.is_complete()
 
     def _auto_worker_loop(self) -> None:
         """Thử direct TCP, direct UDP (100 giây), rồi relay theo từng kết nối."""
@@ -620,6 +660,7 @@ class TransferEngine:
 
     def stop(self) -> None:
         self.is_running = False
+        self._udp_session_cancel.set()
         self._announce_stop.set()
         if self._auto_sock is not None:
             try:
