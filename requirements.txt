@@ -1,0 +1,4 @@
+# Code lõi (tracker, peer, CLI) chỉ dùng thư viện chuẩn của Python.
+# Các gói dưới đây chỉ cần cho app giao diện và đóng gói .exe.
+pywebview>=5.0
+pyinstaller>=6.0

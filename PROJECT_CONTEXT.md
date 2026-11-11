@@ -38,6 +38,15 @@ p2p-file-sharing/
 │   ├── peer_node.py                # PeerNode: TCP Server phục vụ Upload cho các Peer khác (Seeding)
 │   ├── transfer_engine.py          # TransferEngine: Động cơ tải đa luồng (Multi-workers), Resume download
 │   └── selection.py                # Thuật toán chọn mảnh: Rarest-First & Random
+├── run_app.py                      # App desktop cho Peer (pywebview)
+├── run_tracker_admin.py            # App quản trị Tracker (pywebview)
+├── build_exe.ps1                   # Đóng gói 2 app thành P2PShare.exe / P2PTracker.exe
+├── app/                            # Giao diện desktop (xem mục 7)
+│   ├── config.py                   # Cài đặt + danh sách file của app Peer (JSON)
+│   ├── log_buffer.py               # Gom print() thành màn Nhật ký
+│   ├── peer_api.py / tracker_api.py# Hàm Python mà giao diện JS gọi tới
+│   ├── launcher.py                 # Mở cửa sổ pywebview, kéo thả file
+│   └── ui/                         # HTML/CSS/JS: peer.*, tracker.*, common.js, style.css (xem mục 7)
 ├── tests/                          # Kiểm thử hệ thống
 │   ├── __init__.py
 │   ├── test_peer.py                # Test thuật toán Rarest-First & Test End-to-End P2P File Transfer
@@ -207,7 +216,24 @@ python -m unittest discover tests
 
 ---
 
-## 7. 🗓️ KẾ HOẠCH PHÁT TRIỂN TIẾP THEO (16 TUẦN)
+## 7. 🖥️ APP DESKTOP (pywebview)
+
+Ngoài CLI, dự án có 2 app giao diện (giao diện sáng, tiếng Việt). Code lõi vẫn chỉ dùng thư viện chuẩn;
+app cần thêm `pywebview` (`pip install -r requirements.txt`).
+
+| App | Lệnh chạy | Chức năng |
+| :--- | :--- | :--- |
+| **P2P Share** (người dùng) | `python run_app.py` | File của tôi (tiến độ, tốc độ, peer đang tải / đang tải từ mình, trạng thái tit-for-tat), Chia sẻ file (kéo thả, tạo `.meta.json`), Tải file (xem trước + số peer đang có), Tạm dừng / Tiếp tục / Gỡ, Cài đặt (+ trang nâng cao), Nhật ký |
+| **P2P Tracker** (admin) | `python run_tracker_admin.py --port 8000` | Chạy / dừng tracker, xem swarm theo tên file, peer trong swarm, xóa peer, chặn peer (theo peer_id hoặc cả IP), bỏ chặn, hoạt động gần đây |
+
+- **Chạy 2 peer trên cùng máy:** `python run_app.py --data-dir ./peer2`, rồi đổi *Cổng lắng nghe* trong Cài đặt (ví dụ 6882) và khởi động lại app.
+- **Thư mục dữ liệu mặc định:** `%APPDATA%\P2PShare` chứa `config.json`, `tasks.json` (để tự tải tiếp khi mở lại), `downloads/` và `meta/`. Danh sách chặn của tracker nằm ở `%APPDATA%\P2PShare\tracker\tracker_blocklist.json`.
+- **Đóng gói:** `powershell -ExecutionPolicy Bypass -File build_exe.ps1` → `dist\P2PShare.exe`, `dist\P2PTracker.exe` (~12 MB mỗi file, cần WebView2 có sẵn trên Windows 10/11).
+- **Thay đổi giao thức cho app:** `ANNOUNCE` gửi thêm trường `name` (tên file, không bắt buộc). Tracker trả `status: "BLOCKED"` cho peer bị chặn và trả danh sách peer rỗng khi peer bị chặn gọi `GET_PEERS`.
+
+---
+
+## 8. 🗓️ KẾ HOẠCH PHÁT TRIỂN TIẾP THEO (16 TUẦN)
 
 - **Giai đoạn 1 (Tuần 1-8):** Xây dựng Core System (Socket, Framing, Tracker, Storage, Multi-thread Transfer, Rarest-First, Resume Download, E2E Test) ➔ **ĐÃ HOÀN THÀNH**.
 - **Giai đoạn 2 (Tuần 9-16):** Các tính năng nâng cao:
