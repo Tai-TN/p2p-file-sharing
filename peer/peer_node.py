@@ -1,7 +1,7 @@
 import socket
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from storage.piece_manager import PieceManager
 from protocol.messages import (
@@ -83,6 +83,71 @@ class PeerNode:
         self._file_upload_meters: Dict[Tuple[str, str], RateMeter] = {}
         self._file_upload_total: Dict[str, RateMeter] = {}
         self._file_peers: Dict[str, Dict[str, Dict]] = {}
+
+        # Xác minh peer_id trong HANDSHAKE: peer_id -> IP mà Tracker đã ghi nhận.
+        # Được cập nhật từ danh sách peer Tracker trả về (update_known_peers) và,
+        # khi gặp id lạ, hỏi lại Tracker qua peer_resolver(info_hash).
+        self._known_peer_ips: Dict[str, str] = {}
+        self._known_lock = threading.Lock()
+        self.peer_resolver: Optional[Callable[[str], Optional[List[Dict]]]] = None
+        self._last_resolve: Dict[str, float] = {}  # info_hash -> lần hỏi Tracker gần nhất
+        self.rejected_handshakes = 0  # Số HANDSHAKE bị từ chối vì giả mạo id (hiển thị / test)
+
+    # ── Xác minh danh tính peer ──────────────────────────────────────── #
+
+    def update_known_peers(self, peers: List[Dict]) -> None:
+        """Ghi nhận peer_id -> IP từ danh sách peer mà Tracker trả về."""
+        with self._known_lock:
+            for p in peers or []:
+                p_id, ip = p.get("peer_id"), p.get("ip")
+                if p_id and ip:
+                    self._known_peer_ips[p_id] = ip
+
+    def _refresh_from_tracker(self, info_hash: str) -> None:
+        """Hỏi lại Tracker danh sách peer của file (tối đa 1 lần / 5 giây cho mỗi file)."""
+        if self.peer_resolver is None:
+            return
+        now = time.monotonic()
+        with self._known_lock:
+            if now - self._last_resolve.get(info_hash, 0.0) < 5.0:
+                return
+            self._last_resolve[info_hash] = now
+        try:
+            peers = self.peer_resolver(info_hash)
+        except Exception:
+            peers = None
+        if peers:
+            self.update_known_peers(peers)
+
+    def _expected_ip(self, peer_id: str) -> Optional[str]:
+        with self._known_lock:
+            return self._known_peer_ips.get(peer_id)
+
+    @staticmethod
+    def _is_loopback(ip: str) -> bool:
+        return ip.startswith("127.") or ip in ("::1", "localhost")
+
+    def _handshake_identity_ok(self, peer_id: str, info_hash: str, conn_ip: str) -> bool:
+        """
+        Chấp nhận HANDSHAKE trừ khi peer_id đã được Tracker ghi nhận ở MỘT IP KHÁC.
+
+        - Id chưa ai dùng → chấp nhận (peer mới, chưa có công để mà giả mạo).
+        - Id đã biết, đúng IP (hoặc kết nối nội bộ cùng máy) → chấp nhận.
+        - Id đã biết nhưng IP khác → có kẻ giả mạo để chiếm slot Tit-for-Tat → từ chối.
+        """
+        def matches(expected: Optional[str]) -> bool:
+            return (expected is None or expected == conn_ip
+                    or self._is_loopback(conn_ip) or self._is_loopback(expected))
+
+        if matches(self._expected_ip(peer_id)):
+            # Id lạ: hỏi Tracker một lần cho chắc, rồi xét lại.
+            if self._expected_ip(peer_id) is None:
+                self._refresh_from_tracker(info_hash)
+                return matches(self._expected_ip(peer_id))
+            return True
+        # Không khớp: có thể máy đó vừa đổi IP → hỏi lại Tracker trước khi từ chối.
+        self._refresh_from_tracker(info_hash)
+        return matches(self._expected_ip(peer_id))
 
     # ── Quản lý file ──────────────────────────────────────────────────── #
 
@@ -193,6 +258,13 @@ class PeerNode:
             info_hash = msg.get("info_hash")
             remote_peer_id = msg.get("peer_id")
             if not remote_peer_id:
+                return
+
+            if not self._handshake_identity_ok(remote_peer_id, info_hash, addr[0]):
+                self.rejected_handshakes += 1
+                print(f"[PeerNode {self.peer_id}] Từ chối HANDSHAKE: {addr[0]} tự nhận là "
+                      f"{remote_peer_id} nhưng Tracker ghi nhận id này ở IP khác (giả mạo id).")
+                remote_peer_id = None  # Không đăng ký vào choking, không ghi công
                 return
 
             self._choking.register_peer(remote_peer_id)

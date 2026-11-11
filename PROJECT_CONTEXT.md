@@ -231,6 +231,16 @@ app cần thêm `pywebview` (`pip install -r requirements.txt`).
 - **Đóng gói:** `powershell -ExecutionPolicy Bypass -File build_exe.ps1` → `dist\P2PShare.exe`, `dist\P2PTracker.exe` (~12 MB mỗi file, cần WebView2 có sẵn trên Windows 10/11).
 - **Thay đổi giao thức cho app:** `ANNOUNCE` gửi thêm trường `name` (tên file, không bắt buộc). Tracker trả `status: "BLOCKED"` cho peer bị chặn và trả danh sách peer rỗng khi peer bị chặn gọi `GET_PEERS`.
 
+### Danh tính peer (`peer_id`)
+Tracker và Tit-for-Tat (số liệu đóng góp, slot unchoke) đều dựa vào `peer_id`, nên id phải **cố định** và **không trùng**:
+- **Dạng id:** `peer_` + 12 ký tự hex của `uuid4` (`peer/identity.py`). Id được sinh **một lần** rồi lưu lại: app lưu trong `config.json`, CLI lưu trong `demo_workspace/.peer_id_<cổng>`. Thoát ra vào lại vẫn giữ nguyên id.
+- **Tracker từ chối id trùng:** nếu một `peer_id` đang còn sống (announce trong `peer_timeout`) mà đến từ **IP khác**, tracker trả `status: "DUPLICATE_ID"` (kể cả với `event="stopped"`, để không ai đá peer khác bằng id giả). Cùng IP thì coi là chính máy đó khởi động lại, kể cả khi đổi cổng. App hiện thông báo "Trùng id" và gợi ý đổi tên peer.
+- **Xác minh HANDSHAKE ở cả hai phía:**
+  - `PeerConnection` từ chối nếu `peer_id` trong `HANDSHAKE_RESPONSE` khác peer mình định kết nối.
+  - `PeerNode` từ chối nếu `peer_id` trong `HANDSHAKE` đã được tracker ghi nhận ở một IP khác (hỏi lại tracker một lần trước khi từ chối). Id lạ vẫn được chấp nhận.
+  - Nhờ vậy free-rider không thể mạo danh một peer đang đóng góp tốt để chiếm slot Tit-for-Tat.
+- **Giới hạn:** cách này không chống được một máy tự tạo nhiều id mới (Sybil). Muốn chặn hẳn việc mạo danh thì cần khóa bí mật / chữ ký cho mỗi peer.
+
 ---
 
 ## 8. 🗓️ KẾ HOẠCH PHÁT TRIỂN TIẾP THEO (16 TUẦN)

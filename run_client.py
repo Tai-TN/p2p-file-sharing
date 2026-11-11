@@ -15,6 +15,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 from peer.client import P2PClient
+from peer.identity import load_or_create_peer_id
 
 # ── Cấu hình ──
 LISTEN_PORT  = int(sys.argv[1]) if len(sys.argv) > 1 else 6881
@@ -38,7 +39,8 @@ def print_menu(peer_id: str) -> None:
 
 
 def main() -> None:
-    peer_id = f"peer_{random.randint(1000, 9999)}"
+    # Mỗi cổng lắng nghe giữ một peer_id cố định (chạy nhiều peer trên 1 máy vẫn khác id).
+    peer_id = load_or_create_peer_id(os.path.join(BASE_DIR, "demo_workspace", f".peer_id_{LISTEN_PORT}"))
 
     client = P2PClient(
         peer_id=peer_id,

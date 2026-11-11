@@ -74,6 +74,10 @@ class TransferEngine:
         self.peer_meters: Dict[str, RateMeter] = {}
         # Tracker trả về BLOCKED nếu admin đã chặn peer này.
         self.blocked_by_tracker = False
+        # Tracker trả về DUPLICATE_ID nếu peer_id này đang được một máy khác dùng.
+        self.duplicate_id = False
+        # PeerNode của client (để cập nhật danh sách peer_id -> IP dùng xác minh HANDSHAKE).
+        self.peer_node = None
         # Lần cuối liên lạc Tracker thành công (None = chưa từng / đang lỗi).
         self.tracker_ok: Optional[bool] = None
 
@@ -164,12 +168,20 @@ class TransferEngine:
             bad_to_report = []  # Đã gửi thành công, không cần đưa lại vào hàng chờ
             self.tracker_ok = True
 
-            if announce_resp.get("status") == "BLOCKED":
+            status = announce_resp.get("status")
+            if status == "BLOCKED":
                 if not self.blocked_by_tracker:
                     print(f"[TransferEngine {self.peer_id}] Lỗi: Tracker đã chặn peer này.")
                 self.blocked_by_tracker = True
                 return []
+            if status == "DUPLICATE_ID":
+                if not self.duplicate_id:
+                    print(f"[TransferEngine {self.peer_id}] Lỗi: Tracker từ chối vì peer_id "
+                          f"'{self.peer_id}' đang được một máy khác dùng. Hãy đổi tên peer.")
+                self.duplicate_id = True
+                return []
             self.blocked_by_tracker = False
+            self.duplicate_id = False
 
             # Sau announce, mở một request riêng để lấy danh sách Peer.
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -181,6 +193,9 @@ class TransferEngine:
             sock2.close()
 
             if p_resp and p_resp.get("peers"):
+                if self.peer_node is not None:
+                    # Ghi nhớ peer_id -> IP để PeerNode xác minh HANDSHAKE đến.
+                    self.peer_node.update_known_peers(p_resp["peers"])
                 return p_resp["peers"]
             return []
         except Exception:
@@ -191,9 +206,11 @@ class TransferEngine:
                     self.pending_bad_reports.update(bad_to_report)
             return []
 
-    def start_seeding(self) -> None:
+    def start_seeding(self, peer_node=None) -> None:
         """Khởi động chế độ Seeding (duy trì announce lên Tracker cho file đã có)."""
         self.is_running = True
+        if peer_node is not None:
+            self.peer_node = peer_node
         self._announce_to_tracker(event="started")
         announce_thread = threading.Thread(target=self._periodic_announce, daemon=True)
         announce_thread.start()
@@ -615,6 +632,7 @@ class TransferEngine:
             "in_flight": in_flight,
             "running": self.is_running,
             "blocked": self.blocked_by_tracker,
+            "duplicate_id": self.duplicate_id,
             "tracker_ok": self.tracker_ok,
         }
 

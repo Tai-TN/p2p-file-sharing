@@ -20,7 +20,7 @@ class AppConfigTest(unittest.TestCase):
 
     def test_first_run_fills_defaults_and_persists(self):
         cfg = AppConfig(self.tmp)
-        self.assertTrue(cfg["peer_name"].startswith("peer_"))
+        self.assertRegex(cfg["peer_name"], r"^peer_[0-9a-f]{12}$")
         self.assertEqual(cfg["download_dir"], os.path.join(self.tmp, "downloads"))
         again = AppConfig(self.tmp)
         self.assertEqual(again["peer_name"], cfg["peer_name"])

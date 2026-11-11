@@ -10,7 +10,7 @@ from protocol.messages import (
     recv_msg,
     send_msg,
 )
-from tracker.state import TrackerState
+from tracker.state import REGISTER_BLOCKED, REGISTER_DUPLICATE_ID, REGISTER_OK, TrackerState
 from tracker.tracker_server import TrackerServer
 
 
@@ -44,18 +44,18 @@ class TrackerStateAdminTest(unittest.TestCase):
     def test_blocked_peer_is_removed_and_cannot_rejoin(self):
         removed = self.state.block_peer("peer_b")
         self.assertEqual(removed, 2)
-        self.assertFalse(self.state.register_peer("h1", "peer_b", "10.0.0.2", 6882))
+        self.assertEqual(self.state.register_peer("h1", "peer_b", "10.0.0.2", 6882), REGISTER_BLOCKED)
         self.assertNotIn("peer_b", [p["peer_id"] for p in self.state.get_peers("h1")])
 
     def test_block_by_ip_rejects_new_peer_id_from_same_ip(self):
         self.state.block_peer("peer_b", ip="10.0.0.2")
-        self.assertFalse(self.state.register_peer("h1", "peer_new", "10.0.0.2", 7000))
+        self.assertEqual(self.state.register_peer("h1", "peer_new", "10.0.0.2", 7000), REGISTER_BLOCKED)
         self.assertTrue(self.state.is_blocked("anything", "10.0.0.2"))
 
     def test_unblock_allows_rejoin(self):
         self.state.block_peer("peer_b")
         self.assertTrue(self.state.unblock_peer("peer_b"))
-        self.assertTrue(self.state.register_peer("h1", "peer_b", "10.0.0.2", 6882))
+        self.assertEqual(self.state.register_peer("h1", "peer_b", "10.0.0.2", 6882), REGISTER_OK)
 
     def test_events_are_logged_newest_first(self):
         self.state.block_peer("peer_a")

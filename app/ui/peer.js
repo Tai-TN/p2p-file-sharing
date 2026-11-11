@@ -92,6 +92,10 @@ function renderNotice(st) {
   let html = "";
   if (st.start_error) {
     html = `<div class="notice red" style="margin-bottom:14px">${icon("alert")}<span>${esc(st.start_error)}</span></div>`;
+  } else if (st.client && st.client.duplicate_id && !st.needs_restart) {
+    html = `<div class="notice red" style="margin-bottom:14px;align-items:center">${icon("alert")}
+      <span class="grow">Tracker từ chối vì tên peer <b>${esc(st.client.peer_id)}</b> đang được một máy khác dùng. Đổi tên peer rồi khởi động lại app.</span>
+      <button class="btn sm" data-goto="settings">Mở cài đặt</button></div>`;
   } else if (st.needs_restart) {
     html = `<div class="notice blue" style="margin-bottom:14px;align-items:center">${icon("info")}
       <span class="grow">Cài đặt mới sẽ có hiệu lực sau khi khởi động lại app.</span>
@@ -111,6 +115,7 @@ const STATE_LABEL = {
 
 function taskPill(t) {
   if (t.blocked) return `<span class="pill red">Bị chặn</span>`;
+  if (t.duplicate_id) return `<span class="pill red">Trùng id</span>`;
   const [label, color] = STATE_LABEL[t.state] || [t.status, "gray"];
   return `<span class="pill ${color}">${esc(label)}</span>`;
 }

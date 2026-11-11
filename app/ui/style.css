@@ -216,7 +216,7 @@ h3 { font-size: 13px; }
 .lv-ERROR { color: var(--bad); }
 .lv-ANNOUNCE { color: var(--accent); }
 .lv-COMPLETED { color: var(--ok); }
-.lv-REPORT, .lv-REMOVED, .lv-TIMEOUT { color: var(--bad); }
+.lv-REPORT, .lv-REMOVED, .lv-TIMEOUT, .lv-REJECTED { color: var(--bad); }
 .lv-ADMIN { color: #534ab7; }
 .lv-STOPPED { color: var(--text-2); }
 

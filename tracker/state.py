@@ -3,6 +3,12 @@ import threading
 from collections import deque
 from typing import Dict, Any, List, Optional
 
+# Kết quả của register_peer()
+REGISTER_OK = "OK"
+REGISTER_BLOCKED = "BLOCKED"            # Admin đã chặn peer_id / IP này
+REGISTER_DUPLICATE_ID = "DUPLICATE_ID"  # peer_id đang được một máy khác (IP khác) dùng
+
+
 class TrackerState:
     """
     Quản lý bộ nhớ trạng thái trung tâm của Tracker.
@@ -43,14 +49,39 @@ class TrackerState:
         with self.lock:
             return peer_id in self.blocked_peer_ids or (bool(ip) and ip in self.blocked_ips)
 
-    def register_peer(self, info_hash: str, peer_id: str, ip: str, port: int, downloaded: int = 0, left: int = 0, event: str = "started", name: str = "") -> bool:
+    def _find_id_conflict(self, peer_id: str, ip: str, now: float) -> Optional[Dict[str, Any]]:
+        """
+        Tìm một mục CÒN SỐNG của peer_id này nhưng đến từ IP khác (gọi khi đang giữ lock).
+
+        Cùng IP thì không tính là trùng: đó là chính máy đó khởi động lại (có thể đổi
+        cổng) trong lúc mục cũ chưa hết hạn. Mục đã quá peer_timeout cũng không tính.
+        """
+        for swarm in self.swarms.values():
+            entry = swarm.get(peer_id)
+            if entry and entry["ip"] != ip and now - entry["last_seen"] <= self.peer_timeout:
+                return entry
+        return None
+
+    def register_peer(self, info_hash: str, peer_id: str, ip: str, port: int, downloaded: int = 0, left: int = 0, event: str = "started", name: str = "") -> str:
         """Đăng ký hoặc cập nhật trạng thái hoạt động của 1 Peer trong Swarm.
 
-        Trả về False nếu peer bị admin chặn (không được đăng ký).
+        Trả về REGISTER_OK, REGISTER_BLOCKED (bị admin chặn) hoặc
+        REGISTER_DUPLICATE_ID (peer_id đang được máy khác dùng).
         """
         with self.lock:
             if peer_id in self.blocked_peer_ids or ip in self.blocked_ips:
-                return False
+                return REGISTER_BLOCKED
+
+            # Một peer_id chỉ thuộc về một máy tại một thời điểm. Từ chối cả "stopped"
+            # từ máy lạ để không ai đá được peer khác ra khỏi swarm bằng id giả.
+            conflict = self._find_id_conflict(peer_id, ip, time.time())
+            if conflict is not None:
+                self._log_event(
+                    "REJECTED",
+                    f"Từ chối {peer_id} từ {ip}: id đang được {conflict['ip']}:{conflict['port']} dùng",
+                )
+                print(f"[Tracker State] Từ chối {peer_id} từ {ip}: trùng id với {conflict['ip']}:{conflict['port']}")
+                return REGISTER_DUPLICATE_ID
 
             if name and info_hash not in self.file_names:
                 self.file_names[info_hash] = name
@@ -65,7 +96,7 @@ class TrackerState:
                     del swarm[peer_id]
                     self._log_event("STOPPED", f"{peer_id} rời {self._name_of(info_hash)}")
                     print(f"[Tracker State] Peer {peer_id} đã thoát khỏi swarm {info_hash[:8]}...")
-                return True
+                return REGISTER_OK
 
             is_new = peer_id not in swarm
             was_complete = (not is_new) and swarm[peer_id].get("left", 1) == 0
@@ -82,7 +113,7 @@ class TrackerState:
             elif event == "completed" and not was_complete:
                 self._log_event("COMPLETED", f"{peer_id} tải xong {self._name_of(info_hash)}")
             print(f"[Tracker State] Cập nhật Peer {peer_id} ({ip}:{port}) cho file {info_hash[:8]}... (event={event})")
-            return True
+            return REGISTER_OK
 
     def get_peers(self, info_hash: str, exclude_peer_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Lấy danh sách các Peer đang online chia sẻ tập tin info_hash (loại trừ chính peer đang hỏi)."""

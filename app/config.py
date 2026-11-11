@@ -1,9 +1,10 @@
 """Đọc / ghi cấu hình và danh sách nhiệm vụ của app Peer (lưu dạng JSON trong thư mục dữ liệu)."""
 import json
 import os
-import random
 import sys
 from typing import Any, Dict, List
+
+from peer.identity import is_valid_peer_id, new_peer_id
 
 DEFAULTS: Dict[str, Any] = {
     "tracker_host": "127.0.0.1",
@@ -65,7 +66,7 @@ class AppConfig:
 
         changed = False
         if not self.values["peer_name"]:
-            self.values["peer_name"] = f"peer_{random.randint(1000, 9999)}"
+            self.values["peer_name"] = new_peer_id()
             changed = True
         if not self.values["download_dir"]:
             self.values["download_dir"] = os.path.join(self.data_dir, "downloads")
@@ -115,8 +116,8 @@ class AppConfig:
                 text = str(value or "").strip()
                 if not text:
                     raise ValueError(f"{label} không được để trống.")
-                if key == "peer_name" and (len(text) > 32 or " " in text):
-                    raise ValueError("Tên peer tối đa 32 ký tự và không có khoảng trắng.")
+                if key == "peer_name" and not is_valid_peer_id(text):
+                    raise ValueError("Tên peer tối đa 40 ký tự, chỉ gồm chữ, số, '_' và '-'.")
                 clean[key] = text
         return clean
 

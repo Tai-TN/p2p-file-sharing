@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional
 from protocol.messages import create_get_peers_msg, recv_msg, send_msg
 from storage.metainfo import create_metainfo, save_metainfo, load_metainfo
 from storage.piece_manager import PieceManager
+from peer.identity import new_peer_id
 from peer.peer_node import PeerNode
 from peer.transfer_engine import TransferEngine
 
@@ -60,7 +61,7 @@ class P2PClient:
                  choking_interval: float = 20.0,
                  measurement_window: float = 30.0,
                  max_workers: int = 4):
-        self.peer_id = peer_id or f"peer_{random.randint(1000, 9999)}"
+        self.peer_id = peer_id or new_peer_id()
         self.listen_port = listen_port
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
@@ -84,6 +85,9 @@ class P2PClient:
             choking_interval=choking_interval,
             measurement_window=measurement_window,
         )
+
+        # PeerNode hỏi Tracker khi gặp peer_id lạ trong HANDSHAKE (xác minh danh tính).
+        self.node.peer_resolver = self.query_peers
 
         # Bảng nhiệm vụ: { info_hash: task_dict }
         self._tasks: Dict[str, Dict] = {}
@@ -173,7 +177,7 @@ class P2PClient:
 
         # Tạo engine để Announce lên Tracker và duy trì Seeding
         engine = self._new_engine(pm)
-        engine.start_seeding()
+        engine.start_seeding(peer_node=self.node)
 
         with self._lock:
             self._tasks[info_hash] = {
@@ -441,7 +445,7 @@ class P2PClient:
                 tracker_flags.append(snap["tracker_ok"])
             else:
                 snap = {"download_rate": 0.0, "peers": [], "eta_seconds": None,
-                        "blocked": False, "downloaded_bytes": 0}
+                        "blocked": False, "duplicate_id": False, "downloaded_bytes": 0}
             downloading = task["state"] == STATE_DOWNLOADING
             down_rate = snap["download_rate"] if downloading else 0.0
             total_down += down_rate
@@ -466,6 +470,7 @@ class P2PClient:
                 "download_peers": snap.get("peers", []) if downloading else [],
                 "upload_peers": self.node.snapshot_uploads(info_hash),
                 "blocked": snap.get("blocked", False),
+                "duplicate_id": snap.get("duplicate_id", False),
             })
 
         # Tracker được coi là "ok" nếu lần liên lạc gần nhất của bất kỳ engine nào thành công.
@@ -483,5 +488,6 @@ class P2PClient:
             "tracker_ok": tracker_ok,
             "download_rate": total_down,
             "upload_rate": self.node.upload_meter.rate(),
+            "duplicate_id": any(t["duplicate_id"] for t in items),
             "tasks": items,
         }

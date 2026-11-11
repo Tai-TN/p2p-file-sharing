@@ -67,6 +67,15 @@ class PeerConnection:
             ):
                 raise ConnectionError("HANDSHAKE_RESPONSE không hợp lệ")
 
+            # Bên kia phải đúng là peer mình định kết nối (theo danh sách Tracker).
+            # Nếu không, số byte tải được sẽ bị ghi công nhầm cho peer khác trong
+            # Tit-for-Tat. Peer bản cũ không gửi peer_id thì bỏ qua bước này.
+            responder_id = response.get("peer_id")
+            if responder_id and self.remote_peer_id and responder_id != self.remote_peer_id:
+                raise ConnectionError(
+                    f"peer_id không khớp: chờ {self.remote_peer_id}, nhận {responder_id}"
+                )
+
             bitfield_msg = recv_msg(sock)
             if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
                 raise ConnectionError("Không nhận được BITFIELD")

@@ -15,7 +15,7 @@ from protocol.messages import (
     send_msg,
     recv_msg
 )
-from .state import TrackerState
+from .state import REGISTER_OK, TrackerState
 
 class TrackerServer:
     """
@@ -87,8 +87,8 @@ class TrackerServer:
                 announced_ip = msg.get("ip", "").strip()
                 peer_ip = announced_ip if announced_ip else client_ip
 
-                # Đăng ký thông tin peer (trả về False nếu peer bị admin chặn)
-                accepted = self.state.register_peer(
+                # Đăng ký thông tin peer (có thể bị từ chối: bị chặn / trùng peer_id)
+                result = self.state.register_peer(
                     info_hash=info_hash,
                     peer_id=peer_id,
                     ip=peer_ip,
@@ -98,10 +98,10 @@ class TrackerServer:
                     event=event,
                     name=str(msg.get("name", "") or ""),
                 )
-                if not accepted:
+                if result != REGISTER_OK:
                     send_msg(conn, {
                         "type": MessageType.ANNOUNCE_RESPONSE.value,
-                        "status": "BLOCKED",
+                        "status": result,  # "BLOCKED" hoặc "DUPLICATE_ID"
                         "interval": 30,
                     })
                     return
