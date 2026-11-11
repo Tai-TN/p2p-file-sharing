@@ -65,14 +65,19 @@ class PieceManager:
         #self.verify_all_pieces()
         
 
-    def verify_all_pieces(self) -> None:
-        """Xác minh toàn bộ các piece hiện có trên đĩa so với SHA-256 mong đợi."""
+    def verify_all_pieces(self, on_progress=None) -> None:
+        """Xác minh toàn bộ các piece hiện có trên đĩa so với SHA-256 mong đợi.
+
+        on_progress(done, total): gọi sau mỗi mảnh (dùng cho thanh tiến độ trên giao diện).
+        """
         for i in range(self.num_pieces):
             piece_data = self._read_raw_piece(i)
             if piece_data and self._hash_matches(i, piece_data):
                 self.bitfield[i] = True
             else:
                 self.bitfield[i] = False
+            if on_progress:
+                on_progress(i + 1, self.num_pieces)
 
     def _get_piece_bounds(self, piece_index: int) -> tuple:
         """Tính offset bắt đầu và độ dài thực tế của mảnh thứ piece_index."""

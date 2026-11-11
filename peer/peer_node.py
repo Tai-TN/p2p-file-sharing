@@ -1,7 +1,7 @@
 import socket
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from storage.piece_manager import PieceManager
 from protocol.messages import (
@@ -14,6 +14,7 @@ from protocol.messages import (
     create_unchoke_msg,
 )
 from .choking import ChokingManager
+from .stats import RateMeter
 
 
 class PeerNode:
@@ -74,6 +75,14 @@ class PeerNode:
             choking_interval=choking_interval,
             measurement_window=measurement_window,
         )
+
+        # Số liệu upload cho giao diện.
+        self.upload_meter = RateMeter()  # Tổng tốc độ upload của cả node.
+        self._stats_lock = threading.Lock()
+        # (info_hash, peer_id) -> RateMeter; peer đang kết nối theo từng file.
+        self._file_upload_meters: Dict[Tuple[str, str], RateMeter] = {}
+        self._file_upload_total: Dict[str, RateMeter] = {}
+        self._file_peers: Dict[str, Dict[str, Dict]] = {}
 
     # ── Quản lý file ──────────────────────────────────────────────────── #
 
@@ -169,6 +178,7 @@ class PeerNode:
             self._sent_choking_states[conn] = None
 
         remote_peer_id = None
+        stats_info_hash = None
         try:
             # Bước 1: Nhận HANDSHAKE
             msg = recv_msg(conn)
@@ -190,6 +200,14 @@ class PeerNode:
 
             if pm is None:
                 return  # Không có file này → đóng kết nối
+
+            # Ghi nhận peer đang kết nối cho file này (hiển thị trên giao diện).
+            with self._stats_lock:
+                entry = self._file_peers.setdefault(info_hash, {}).setdefault(
+                    remote_peer_id, {"ip": addr[0], "sockets": 0}
+                )
+                entry["sockets"] += 1
+            stats_info_hash = info_hash
 
             # Bước 2: Phản hồi handshake và gửi BITFIELD
             self._send(conn, {
@@ -234,6 +252,7 @@ class PeerNode:
                             # tính request hoặc piece đọc lỗi là upload hợp lệ.
                             if self._send(conn, create_piece_msg(piece_idx, data)):
                                 self._choking.record_upload(remote_peer_id, len(data))
+                                self._record_upload_stats(info_hash, remote_peer_id, len(data))
                         else:
                             self._send(conn, {"type": MessageType.ERROR.value, "piece_index": piece_idx})
                 elif req_type == MessageType.INTERESTED.value:
@@ -251,6 +270,14 @@ class PeerNode:
         except Exception:
             pass  # Dữ liệu JSON không hợp lệ → đóng kết nối
         finally:
+            if stats_info_hash and remote_peer_id:
+                with self._stats_lock:
+                    peers = self._file_peers.get(stats_info_hash, {})
+                    entry = peers.get(remote_peer_id)
+                    if entry is not None:
+                        entry["sockets"] -= 1
+                        if entry["sockets"] <= 0:
+                            peers.pop(remote_peer_id, None)
             if remote_peer_id:
                 with self._sock_lock:
                     peer_sockets = self._socket_peers.get(remote_peer_id)
@@ -328,6 +355,53 @@ class PeerNode:
                 if self._send(sock, message):
                     with self._sock_lock:
                         self._sent_choking_states[sock] = True
+
+    # ── Số liệu cho giao diện ─────────────────────────────────────────── #
+
+    def _record_upload_stats(self, info_hash: str, peer_id: str, byte_count: int) -> None:
+        self.upload_meter.add(byte_count)
+        with self._stats_lock:
+            meter = self._file_upload_meters.setdefault((info_hash, peer_id), RateMeter())
+            total = self._file_upload_total.setdefault(info_hash, RateMeter())
+        meter.add(byte_count)
+        total.add(byte_count)
+
+    def file_upload_rate(self, info_hash: str) -> float:
+        """Tốc độ upload hiện tại (byte/giây) của riêng một file."""
+        with self._stats_lock:
+            meter = self._file_upload_total.get(info_hash)
+        return meter.rate() if meter else 0.0
+
+    def file_uploaded_bytes(self, info_hash: str) -> int:
+        with self._stats_lock:
+            meter = self._file_upload_total.get(info_hash)
+        return meter.total if meter else 0
+
+    def snapshot_uploads(self, info_hash: str) -> List[Dict]:
+        """Danh sách peer đang tải file info_hash từ mình, kèm trạng thái Tit-for-Tat."""
+        unchoked = self._choking.unchoked_peers()
+        optimistic = self._choking.optimistic_peers()
+        with self._stats_lock:
+            peers = {p: dict(v) for p, v in self._file_peers.get(info_hash, {}).items()}
+            meters = {p: self._file_upload_meters.get((info_hash, p)) for p in peers}
+        result = []
+        for p_id, info in peers.items():
+            meter = meters.get(p_id)
+            if p_id in optimistic:
+                choke_state = "optimistic"
+            elif p_id in unchoked:
+                choke_state = "unchoked"
+            else:
+                choke_state = "choked"
+            result.append({
+                "peer_id": p_id,
+                "ip": info["ip"],
+                "rate": meter.rate() if meter else 0.0,
+                "sent": meter.total if meter else 0,
+                "choke_state": choke_state,
+            })
+        result.sort(key=lambda p: (-p["rate"], p["peer_id"]))
+        return result
 
     def record_download(self, peer_id: str, byte_count: int) -> None:
         """Ghi nhận số byte nhận được từ Peer để tính điểm Tit-for-Tat."""

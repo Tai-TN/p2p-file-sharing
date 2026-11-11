@@ -16,6 +16,7 @@ from protocol.messages import (
 from .selection import choose_next_piece
 from .connection import PeerConnection
 from .peer_selector import PeerSelector
+from .stats import RateMeter
 
 # Peer bị ngắt do chết / gửi sai dữ liệu sẽ bị bỏ qua trong khoảng thời gian này (giây).
 FAILED_PEER_COOLDOWN = 120.0
@@ -67,6 +68,14 @@ class TransferEngine:
 
         # File tạm lưu bitfield để có thể tiếp tục download sau khi khởi động lại.
         self.progress_file = f"{piece_manager.target_file_path}.progress.json"
+
+        # Số liệu cho giao diện: tốc độ tải tổng và theo từng peer.
+        self.download_meter = RateMeter()
+        self.peer_meters: Dict[str, RateMeter] = {}
+        # Tracker trả về BLOCKED nếu admin đã chặn peer này.
+        self.blocked_by_tracker = False
+        # Lần cuối liên lạc Tracker thành công (None = chưa từng / đang lỗi).
+        self.tracker_ok: Optional[bool] = None
 
     def start_download(self, peer_node=None) -> bool:
         """Khởi động các worker và tải các piece còn thiếu song song."""
@@ -144,14 +153,23 @@ class TransferEngine:
                 event=event,
                 downloaded=downloaded_bytes,
                 left=left_bytes,
-                bad_peers=bad_to_report  # Báo cáo peer chết
+                bad_peers=bad_to_report,  # Báo cáo peer chết
+                name=self.piece_manager.info.get("name", ""),
             )
             if bad_to_report:
                 print(f"[TransferEngine {self.peer_id}] Báo cáo {len(bad_to_report)} peer chết lên Tracker: {bad_to_report}")
             send_msg(sock, msg)
-            recv_msg(sock)
+            announce_resp = recv_msg(sock)
             sock.close()
             bad_to_report = []  # Đã gửi thành công, không cần đưa lại vào hàng chờ
+            self.tracker_ok = True
+
+            if announce_resp.get("status") == "BLOCKED":
+                if not self.blocked_by_tracker:
+                    print(f"[TransferEngine {self.peer_id}] Lỗi: Tracker đã chặn peer này.")
+                self.blocked_by_tracker = True
+                return []
+            self.blocked_by_tracker = False
 
             # Sau announce, mở một request riêng để lấy danh sách Peer.
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -166,6 +184,7 @@ class TransferEngine:
                 return p_resp["peers"]
             return []
         except Exception:
+            self.tracker_ok = False
             # Gửi báo cáo thất bại → đưa lại vào hàng chờ để lần sau gửi tiếp
             if bad_to_report:
                 with self.lock:
@@ -441,6 +460,10 @@ class TransferEngine:
         # ── Thành công ───────────────────────────────────────────────────
         # Chỉ cập nhật tốc độ sau khi dữ liệu đã ghi và xác minh thành công.
         self.peer_selector.record_success(p_id, len(piece_data), request_elapsed)
+        self.download_meter.add(len(piece_data))
+        with self.lock:
+            meter = self.peer_meters.setdefault(p_id, RateMeter())
+        meter.add(len(piece_data))
         if self.peer_node:
             # PeerNode dùng số liệu này để xếp hạng regular unchoking.
             self.peer_node.record_download(p_id, len(piece_data))
@@ -551,9 +574,57 @@ class TransferEngine:
 
         # Trường hợp 3: File mới → bitfield mặc định toàn False là đúng.
 
+    def snapshot(self) -> Dict:
+        """Ảnh chụp trạng thái tải cho giao diện (chỉ đọc, không đổi logic tải)."""
+        pm = self.piece_manager
+        have = pm.completed_pieces_count()
+        # Piece cuối có thể nhỏ hơn; tính byte đã có chính xác theo từng piece.
+        downloaded_bytes = sum(self._piece_size(i) for i, ok in enumerate(pm.bitfield) if ok)
+        speed = self.download_meter.rate()
+        left_bytes = pm.file_size - downloaded_bytes
+        eta = (left_bytes / speed) if speed > 0 and left_bytes > 0 else None
+
+        with self.lock:
+            peers = []
+            for p_id, info in self.connected_peers.items():
+                bf = info.get("bitfield") or []
+                meter = self.peer_meters.get(p_id)
+                peers.append({
+                    "peer_id": p_id,
+                    "ip": info.get("ip"),
+                    "port": info.get("port"),
+                    "have": sum(1 for b in bf if b),
+                    "rate": meter.rate() if meter else 0.0,
+                    "received": meter.total if meter else 0,
+                    "bad_data": info.get("bad_data_count", 0),
+                })
+            in_flight = len(self.in_flight_pieces)
+
+        peers.sort(key=lambda p: (-p["rate"], p["peer_id"]))
+        return {
+            "info_hash": self.info_hash,
+            "name": pm.info.get("name", ""),
+            "file_size": pm.file_size,
+            "num_pieces": pm.num_pieces,
+            "have_pieces": have,
+            "progress": round(pm.progress_percentage(), 1),
+            "downloaded_bytes": downloaded_bytes,
+            "download_rate": speed,
+            "eta_seconds": eta,
+            "peers": peers,
+            "in_flight": in_flight,
+            "running": self.is_running,
+            "blocked": self.blocked_by_tracker,
+            "tracker_ok": self.tracker_ok,
+        }
+
     def stop(self) -> None:
         """Dừng worker logic và xóa danh sách Peer đang được quản lý."""
+        was_running = self.is_running
         self.is_running = False
+        # Lưu bitfield ngay khi dừng để lần "Tiếp tục" không phải tải lại mảnh đã có.
+        if was_running and not self.piece_manager.is_complete():
+            self._save_progress()
         with self.lock:
             for connection in tuple(self._worker_connections):
                 connection.close()

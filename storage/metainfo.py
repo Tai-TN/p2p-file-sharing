@@ -1,7 +1,7 @@
 import os
 import json
 import hashlib
-from typing import Dict, Any
+from typing import Dict, Any, Callable, Optional
 
 DEFAULT_PIECE_LENGTH = 512 * 1024  # 512 KB per piece
 
@@ -9,15 +9,18 @@ def calculate_sha256(data: bytes) -> str:
     """Tính mã băm SHA-256 cho mảng bytes."""
     return hashlib.sha256(data).hexdigest()
 
-def create_metainfo(file_path: str, piece_length: int = DEFAULT_PIECE_LENGTH, tracker_url: str = "127.0.0.1:8000") -> Dict[str, Any]:
+def create_metainfo(file_path: str, piece_length: int = DEFAULT_PIECE_LENGTH, tracker_url: str = "127.0.0.1:8000",
+                    on_progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
     """
     Chia nhỏ tập tin thành các mảnh (Piece) và tạo Dictionary metainfo (tương tự file .torrent).
+    on_progress(done, total): gọi sau mỗi mảnh được băm (dùng cho thanh tiến độ trên giao diện).
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Tập tin không tồn tại: {file_path}")
 
     file_size = os.path.getsize(file_path)
     file_name = os.path.basename(file_path)
+    total_pieces = (file_size + piece_length - 1) // piece_length
 
     pieces = []
     with open(file_path, "rb") as f:
@@ -26,6 +29,8 @@ def create_metainfo(file_path: str, piece_length: int = DEFAULT_PIECE_LENGTH, tr
             if not chunk:
                 break
             pieces.append(calculate_sha256(chunk))
+            if on_progress:
+                on_progress(len(pieces), total_pieces)
 
     # Cấu trúc nội dung thông tin tập tin
     info = {
