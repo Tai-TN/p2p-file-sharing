@@ -93,6 +93,11 @@ class PeerNode:
 
     def remove_file(self, info_hash: str) -> bool:
         """Hủy đăng ký một file. Trả về True nếu file tồn tại và bị xóa."""
+        # Gỡ file thì xóa luôn số liệu upload của file đó (thêm lại sẽ đếm từ 0).
+        with self._stats_lock:
+            self._file_upload_total.pop(info_hash, None)
+            for key in [k for k in self._file_upload_meters if k[0] == info_hash]:
+                del self._file_upload_meters[key]
         with self._pm_lock:
             if info_hash in self._piece_managers:
                 del self._piece_managers[info_hash]

@@ -191,9 +191,10 @@ class P2PClient:
         return info_hash
 
     # ── Tải file (Leecher)
-    def download_file(self, meta_file_path: str, download_dir: str) -> str:
+    def download_file(self, meta_file_path: str, download_dir: str, start_paused: bool = False) -> str:
         """
         Tải một file từ mạng P2P dựa vào file .meta.json.Tiến trình tải chạy ngầm trên background thread.Trả về info_hash của file.
+        start_paused=True: chỉ thêm vào danh sách ở trạng thái Tạm dừng (dùng khi mở lại app).
         """
         if not os.path.exists(meta_file_path):
             raise FileNotFoundError(f"File metadata không tồn tại: {meta_file_path}")
@@ -224,7 +225,12 @@ class P2PClient:
                 "meta_path": os.path.abspath(meta_file_path),
                 "file_path": os.path.abspath(download_path),
             }
+            if start_paused:
+                self._tasks[info_hash]["state"] = STATE_PAUSED
+                self._tasks[info_hash]["status"] = "Tạm dừng"
 
+        if start_paused:
+            return info_hash
         self._start_download_engine(info_hash)
         print(f"[P2PClient] Đã khởi động tải ngầm: {file_name}")
         return info_hash
