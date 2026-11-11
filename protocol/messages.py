@@ -81,8 +81,11 @@ def recv_msg(sock) -> Dict[str, Any]:
 
 def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
                         event: str = "started", downloaded: int = 0, left: int = 0,
-                        bad_peers: Optional[List[str]] = None) -> Dict[str, Any]:
+                        bad_peers: Optional[List[str]] = None,
+                        name: str = "") -> Dict[str, Any]:
+    # "name" là tên file (không bắt buộc) để Tracker hiển thị trên giao diện quản trị.
     return {
+        "name": name,
         "type": MessageType.ANNOUNCE.value,
         "info_hash": info_hash,
         "peer_id": peer_id,

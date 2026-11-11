@@ -29,6 +29,7 @@ class TrackerServer:
         self.is_running = False
         self.accept_thread: Optional[threading.Thread] = None
         self.cleanup_thread: Optional[threading.Thread] = None
+        self.start_time: Optional[float] = None
 
     def start(self) -> None:
         """Khởi động máy chủ Tracker Server và luồng dọn dẹp định kỳ."""
@@ -37,6 +38,7 @@ class TrackerServer:
         self.server_socket.bind((self.host, self.port)) 
         self.server_socket.listen(128) # # -> Listening socket, tối đa 128 người chờ
         self.is_running = True
+        self.start_time = time.time()  # Dùng để hiển thị thời gian chạy trên app admin
 
         print(f"[Tracker Server] Đang khởi chạy và lắng nghe tại {self.host}:{self.port}")
 
@@ -85,16 +87,24 @@ class TrackerServer:
                 announced_ip = msg.get("ip", "").strip()
                 peer_ip = announced_ip if announced_ip else client_ip
 
-                # Đăng ký thông tin peer
-                self.state.register_peer(
+                # Đăng ký thông tin peer (trả về False nếu peer bị admin chặn)
+                accepted = self.state.register_peer(
                     info_hash=info_hash,
                     peer_id=peer_id,
                     ip=peer_ip,
                     port=peer_port,
                     downloaded=downloaded,
                     left=left,
-                    event=event
+                    event=event,
+                    name=str(msg.get("name", "") or ""),
                 )
+                if not accepted:
+                    send_msg(conn, {
+                        "type": MessageType.ANNOUNCE_RESPONSE.value,
+                        "status": "BLOCKED",
+                        "interval": 30,
+                    })
+                    return
 
                 # Xử lý báo cáo peer chết từ Leecher
                 bad_peers = msg.get("bad_peers", [])
@@ -117,7 +127,11 @@ class TrackerServer:
                 info_hash = msg.get("info_hash")
                 request_peer_id = msg.get("peer_id")
 
-                peers_list = self.state.get_peers(info_hash, exclude_peer_id=request_peer_id)
+                # Peer bị chặn không được nhận danh sách peer.
+                if self.state.is_blocked(request_peer_id or "", client_ip):
+                    peers_list = []
+                else:
+                    peers_list = self.state.get_peers(info_hash, exclude_peer_id=request_peer_id)
                 
                 response = {
                     "type": MessageType.GET_PEERS_RESPONSE.value,
