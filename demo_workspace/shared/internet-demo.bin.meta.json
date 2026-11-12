@@ -1,0 +1,14 @@
+{
+    "tracker": "100.108.79.47:8000",
+    "info_hash": "3f56ecd2414e53f705a8fe7f809f4b7f5e5163edd262d133cd44d942d2cc0693",
+    "info": {
+        "name": "internet-demo.bin",
+        "file_size": 1572864,
+        "piece_length": 524288,
+        "pieces": [
+            "5f7a26e1d78cd171b1aab0208da133e996c75285b94aa8ef06c6578ea0b26903",
+            "55854a6b13148e4237a428566701ec6655e85b94bc36395a1d02c7e9f9cceacf",
+            "37da3bf55a680e84babc2b5cccdae247b2b3060c9733ef927416aa387d36fef7"
+        ]
+    }
+}

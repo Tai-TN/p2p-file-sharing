@@ -13,6 +13,9 @@ from protocol.messages import (
 from tracker.state import TrackerState
 from tracker.tracker_server import TrackerServer
 
+# Tracker kiểm tra info_hash phải là SHA-256 hex (64 ký tự).
+HX = "ab" * 32
+
 
 class TrackerStateAdminTest(unittest.TestCase):
     def setUp(self):
@@ -82,16 +85,16 @@ class TrackerServerBlockTest(unittest.TestCase):
             return recv_msg(sock)
 
     def test_announce_carries_name_and_blocked_peer_gets_blocked_status(self):
-        resp = self._request(create_announce_msg("hx", "peer_x", 6881, ip="10.1.1.1", name="a.bin"))
+        resp = self._request(create_announce_msg(HX, "peer_x", 6881, ip="10.1.1.1", name="a.bin"))
         self.assertEqual(resp["status"], "OK")
         self.assertEqual(self.server.state.snapshot()["swarms"][0]["name"], "a.bin")
 
         self.server.state.block_peer("peer_x")
-        resp = self._request(create_announce_msg("hx", "peer_x", 6881, ip="10.1.1.1"))
+        resp = self._request(create_announce_msg(HX, "peer_x", 6881, ip="10.1.1.1"))
         self.assertEqual(resp["status"], "BLOCKED")
 
-        self._request(create_announce_msg("hx", "peer_y", 6882, ip="10.1.1.2"))
-        resp = self._request(create_get_peers_msg("hx", "peer_x"))
+        self._request(create_announce_msg(HX, "peer_y", 6882, ip="10.1.1.2"))
+        resp = self._request(create_get_peers_msg(HX, "peer_x"))
         self.assertEqual(resp["type"], MessageType.GET_PEERS_RESPONSE.value)
         self.assertEqual(resp["peers"], [])
 

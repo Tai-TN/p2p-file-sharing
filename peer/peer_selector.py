@@ -133,6 +133,21 @@ class PeerSelector:
             self._states[selected[0]].pending_requests += 1
             return selected
 
+    def rank_peers(self, available_peers: Sequence[PeerCandidate],
+                   piece_size: int, now: Optional[float] = None) -> List[PeerCandidate]:
+        """Xếp ứng viên theo ETA để chọn đường, không giữ chỗ request."""
+        if piece_size <= 0:
+            raise ValueError("piece_size must be positive")
+        timestamp = time.monotonic() if now is None else now
+        with self._lock:
+            candidates = self._eligible_candidates(available_peers, timestamp)
+            known = [s.estimated_rate for s in self._states.values()
+                     if s.estimated_rate is not None]
+            bootstrap = max(known, default=self.default_bootstrap_rate)
+            return sorted(candidates,
+                          key=lambda item: self._eta(self._states[item[0]],
+                                                     piece_size, bootstrap))
+
     def record_success(
         self,
         peer_id: str,
@@ -254,4 +269,4 @@ class PeerSelector:
     @staticmethod
     def _release_request(state: PeerState) -> None:
         # max(0, ...) bảo đảm pending không bị âm nếu release lặp do lỗi ở caller.
-        state.pending_requests = max(0, state.pending_requests - 1)
+        state.pending_requests = max(0, state.pending_requests - 1)

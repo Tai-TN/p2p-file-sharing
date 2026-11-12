@@ -408,4 +408,3 @@ Chạy lại test end-to-end hiện có trong `tests/test_peer.py`, bảo đảm
    - `explore_rate = 0.1`.
    - `eta_tie_threshold = 0.0`.
    - `eta_tie_threshold = 0.15`.
-

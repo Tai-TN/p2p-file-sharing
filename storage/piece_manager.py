@@ -143,6 +143,7 @@ class PieceManager:
                 f = self._get_file_handle()
                 f.seek(offset)
                 f.write(data)
+                f.flush()
 
                 # Cập nhật trạng thái bitfield
                 self.bitfield[piece_index] = True

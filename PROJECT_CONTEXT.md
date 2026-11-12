@@ -133,10 +133,10 @@ sequenceDiagram
     Tracker-->>Engine: ANNOUNCE_RESPONSE (OK)
     Engine->>Tracker: GET_PEERS (info_hash)
     Tracker-->>Engine: GET_PEERS_RESPONSE ([Peer A: 192.168.1.10:6881])
-    
+
     Engine->>PeerA: TCP Connect & HANDSHAKE (info_hash)
     PeerA-->>Engine: HANDSHAKE_RESPONSE & BITFIELD ([1, 1, 1, ...])
-    
+
     loop 4 Worker Threads tải song song
         Engine->>Engine: Chọn mảnh hiếm nhất (Rarest-First)
         Engine->>PeerA: REQUEST (piece_index)
@@ -244,4 +244,3 @@ app cần thêm `pywebview` (`pip install -r requirements.txt`).
   - **Tuần 13:** Giao diện Web Dashboard (Flask/FastAPI + WebSocket theo dõi swarm real-time).
   - **Tuần 14:** Hỗ trợ Multi-file/folder torrent hoặc Kademlia DHT.
   - **Tuần 15-16:** Đo kiểm hiệu năng (Benchmark), viết báo cáo và bảo vệ đề tài.
-

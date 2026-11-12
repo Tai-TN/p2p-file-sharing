@@ -1,4 +1,5 @@
 import time
+import socket
 import threading
 from collections import deque
 from typing import Dict, Any, List, Optional
@@ -16,10 +17,12 @@ class TrackerState:
 
         # Cấu trúc: { info_hash: { peer_id: { "ip": str, "port": int, "last_seen": float, "downloaded": int, "left": int } } }
         self.swarms: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._bad_reports: Dict[str, Dict[str, set[str]]] = {}
 
-        # Theo dõi số lần bị tố cáo: { info_hash: { bad_peer_id: set(reporter_ids) } }
-        # Nếu >= 2 peer khác nhau tố cáo cùng 1 peer -> xóa ngay
-        self._bad_reports: Dict[str, Dict[str, set]] = {}
+        # Signal channels: { peer_id -> socket } — kênh TCP persistent để push PUNCH_SIGNAL
+        # Dùng lock riêng để không hold lock swarm trong khi gọi mạng
+        self._signal_channels: Dict[str, Any] = {}   # Any = socket.socket
+        self._sc_lock = threading.Lock()
 
         # Tên file theo info_hash (peer gửi kèm trong ANNOUNCE) để hiển thị cho admin.
         self.file_names: Dict[str, str] = {}
@@ -43,8 +46,15 @@ class TrackerState:
         with self.lock:
             return peer_id in self.blocked_peer_ids or (bool(ip) and ip in self.blocked_ips)
 
-    def register_peer(self, info_hash: str, peer_id: str, ip: str, port: int, downloaded: int = 0, left: int = 0, event: str = "started", name: str = "") -> bool:
-        """Đăng ký hoặc cập nhật trạng thái hoạt động của 1 Peer trong Swarm.
+    def register_peer(self, info_hash: str, peer_id: str, ip: str, port: int,
+                      downloaded: int = 0, left: int = 0, event: str = "started",
+                      udp_port: int = 0, public_ip: str = "", name: str = "") -> bool:
+        """
+        Đăng ký hoặc cập nhật trạng thái hoạt động của 1 Peer trong Swarm.
+
+        Trường NAT:
+          udp_port:  UDP port đã NAT-map (từ STUN), dùng cho hole punch.
+          public_ip: Public IP từ STUN (hiện chỉ dùng cho UDP, không ghép với TCP port).
 
         Trả về False nếu peer bị admin chặn (không được đăng ký).
         """
@@ -64,24 +74,35 @@ class TrackerState:
                 if peer_id in swarm:
                     del swarm[peer_id]
                     self._log_event("STOPPED", f"{peer_id} rời {self._name_of(info_hash)}")
+                    self._forget_reports(info_hash, peer_id)
                     print(f"[Tracker State] Peer {peer_id} đã thoát khỏi swarm {info_hash[:8]}...")
                 return True
 
             is_new = peer_id not in swarm
             was_complete = (not is_new) and swarm[peer_id].get("left", 1) == 0
+
+            # Địa chỉ STUN là endpoint UDP, không phải địa chỉ/cổng TCP.
+            # Chỉ dùng IP do peer cấu hình cho thử TCP trực tiếp.
+            # Public endpoint của STUN là UDP; không được ghép với TCP listen_port.
+            advertised_ip = ip
+
             swarm[peer_id] = {
-                "peer_id": peer_id,
-                "ip": ip,
-                "port": port,
+                "peer_id":   peer_id,
+                "ip":        advertised_ip,  # IP tốt nhất để peer khác kết nối
+                "lan_ip":    ip,             # IP LAN gốc — giữ lại để debug
+                "port":      port,
+                "udp_port":  udp_port,       # UDP port cho hole punch (0 = chưa có)
                 "downloaded": downloaded,
-                "left": left,
-                "last_seen": time.time()
+                "left":      left,
+                "last_seen": time.time(),
             }
             if is_new:
                 self._log_event("ANNOUNCE", f"{peer_id} ({ip}:{port}) tham gia {self._name_of(info_hash)}")
             elif event == "completed" and not was_complete:
                 self._log_event("COMPLETED", f"{peer_id} tải xong {self._name_of(info_hash)}")
-            print(f"[Tracker State] Cập nhật Peer {peer_id} ({ip}:{port}) cho file {info_hash[:8]}... (event={event})")
+            nat_info = f" UDP={udp_port}" if udp_port else ""
+            print(f"[Tracker State] Cập nhật Peer {peer_id} ({advertised_ip}:{port}{nat_info}) "
+                  f"cho file {info_hash[:8]}... (event={event})")
             return True
 
     def get_peers(self, info_hash: str, exclude_peer_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -106,49 +127,54 @@ class TrackerState:
                     continue
 
                 active_peers.append({
-                    "peer_id": p_info["peer_id"],
-                    "ip": p_info["ip"],
-                    "port": p_info["port"],
-                    "left": p_info.get("left", 0),
+                    "peer_id":  p_info["peer_id"],
+                    "ip":       p_info["ip"],
+                    "port":     p_info["port"],
+                    "udp_port": p_info.get("udp_port", 0),   # 0 = peer này chưa có STUN
+                    "left":     p_info.get("left", 0),
                 })
 
             return active_peers
 
-    def report_bad_peers(self, info_hash: str, reporter_id: str, bad_peer_ids: List[str]) -> List[str]:
-        """
-        Nhận báo cáo từ reporter_id rằng các peer trong bad_peer_ids đã chết.
-        Nếu >= 2 peer khác nhau tố cáo cùng 1 peer -> xóa ngay khỏi Swarm.
-        Trả về danh sách peer đã bị xóa.
-        """
-        removed = []
+    def _forget_reports(self, info_hash: str, peer_id: str) -> None:
+        reports = self._bad_reports.get(info_hash, {})
+        reports.pop(peer_id, None)
+        for reporters in reports.values():
+            reporters.discard(peer_id)
+        if not reports:
+            self._bad_reports.pop(info_hash, None)
+
+    def report_bad_peers(self, info_hash: str, reporter_id: str,
+                         bad_peer_ids: List[str]) -> List[str]:
+        """Chỉ xóa một peer sau báo cáo của hai thành viên swarm khác nhau."""
+        removed: List[str] = []
         with self.lock:
-            if info_hash not in self._bad_reports:
-                self._bad_reports[info_hash] = {}
-
-            reports = self._bad_reports[info_hash]
             swarm = self.swarms.get(info_hash, {})
-
-            for bad_id in bad_peer_ids:
-                if bad_id == reporter_id:
-                    continue  # Không tự tố cáo chính mình
-
-                if bad_id not in reports:
-                    reports[bad_id] = set()
-                reports[bad_id].add(reporter_id)
+            if reporter_id not in swarm or not isinstance(bad_peer_ids, list):
+                return removed
+            reports = self._bad_reports.setdefault(info_hash, {})
+            for bad_id in bad_peer_ids[:32]:
+                if (not isinstance(bad_id, str) or len(bad_id) > 128
+                        or bad_id == reporter_id or bad_id not in swarm):
+                    continue
+                reporters = reports.setdefault(bad_id, set())
+                reporters.add(reporter_id)
                 self._log_event(
                     "REPORT",
-                    f"{reporter_id} báo {bad_id} mất kết nối ({len(reports[bad_id])} báo cáo)",
+                    f"{reporter_id} báo {bad_id} mất kết nối ({len(reporters)} báo cáo)",
                 )
-
-                # Đủ ngưỡng tố cáo (>= 2 peer khác nhau) -> xóa ngay
-                if len(reports[bad_id]) >= 2 and bad_id in swarm:
+                if len(reporters) >= 2:
                     del swarm[bad_id]
-                    del reports[bad_id]  # Reset bộ đếm
+                    self._forget_reports(info_hash, bad_id)
                     removed.append(bad_id)
                     self._log_event("REMOVED", f"{bad_id} bị xóa khỏi {self._name_of(info_hash)} do bị báo lỗi")
                     print(f"[Tracker State] Peer {bad_id} bị xóa khỏi swarm {info_hash[:8]}... do bị tố cáo chết bởi >= 2 peer.")
-
         return removed
+
+    def has_peer(self, info_hash: str, peer_id: str) -> bool:
+        with self.lock:
+            peer = self.swarms.get(info_hash, {}).get(peer_id)
+            return bool(peer and time.time() - peer["last_seen"] <= self.peer_timeout)
 
     def cleanup_stale_peers(self) -> int:
         """Dọn dẹp các Peer đã dừng hoạt động hoặc mất kết nối quá thời hạn timeout."""
@@ -163,6 +189,7 @@ class TrackerState:
                         print(f"[Tracker Cleanup] Loại bỏ peer chết: {peer_id} khỏi swarm {info_hash[:8]}...")
                         self._log_event("TIMEOUT", f"{peer_id} quá hạn, bị loại khỏi {self._name_of(info_hash)}")
                         del swarm[peer_id]
+                        self._forget_reports(info_hash, peer_id)
                         removed_count += 1
 
                 # Nếu swarm không còn peer nào thì dọn dẹp swarm
@@ -197,7 +224,7 @@ class TrackerState:
             if not swarm or peer_id not in swarm:
                 return False
             del swarm[peer_id]
-            self._bad_reports.get(info_hash, {}).pop(peer_id, None)
+            self._forget_reports(info_hash, peer_id)
             self._log_event("ADMIN", f"Admin xóa {peer_id} khỏi {self._name_of(info_hash)}")
             if not swarm:
                 del self.swarms[info_hash]
@@ -219,6 +246,7 @@ class TrackerState:
                 for p_id in list(swarm.keys()):
                     if p_id == peer_id or (ip and swarm[p_id]["ip"] == ip):
                         del swarm[p_id]
+                        self._forget_reports(info_hash, p_id)
                         removed += 1
                 if not swarm:
                     del self.swarms[info_hash]
@@ -283,3 +311,81 @@ class TrackerState:
                 "events": list(self.events)[-50:][::-1],
                 "peer_timeout": self.peer_timeout,
             }
+
+    # ── Signal channel management ─────────────────────────────────────────── #
+
+    def register_signal_channel(self, peer_id: str, sock: Any,
+                                 ip: str, udp_port: int, tcp_port: int,
+                                 candidates: Optional[list] = None) -> None:
+        """
+        Lưu socket signal channel persistent của một peer.
+        Cũng lưu thêm endpoint vào một bảng riêng để PUNCH_REQUEST tra cứu.
+        """
+        with self._sc_lock:
+            # Đóng channel cũ nếu peer kết nối lại
+            old = self._signal_channels.get(peer_id)
+            if old:
+                try:
+                    old["sock"].close()
+                except Exception:
+                    pass
+            self._signal_channels[peer_id] = {
+                "sock":     sock,
+                "send_lock": threading.Lock(),
+                "ip":       ip,
+                "udp_port": udp_port,
+                "tcp_port": tcp_port,
+                "candidates": candidates or [],
+            }
+        print(f"[Tracker State] Signal channel đã đăng ký: {peer_id} ({ip}:{udp_port} UDP)")
+
+    def unregister_signal_channel(self, peer_id: str, sock: Any = None) -> None:
+        """Xóa signal channel khi peer ngắt kết nối."""
+        with self._sc_lock:
+            current = self._signal_channels.get(peer_id)
+            if not current or (sock is not None and current["sock"] is not sock):
+                return
+            self._signal_channels.pop(peer_id)
+        print(f"[Tracker State] Signal channel đã ngắt: {peer_id}")
+
+    def get_signal_info(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Tra cứu thông tin signal channel của peer.
+        Trả về dict { sock, ip, udp_port, tcp_port } hoặc None nếu peer không có channel.
+        """
+        with self._sc_lock:
+            info = self._signal_channels.get(peer_id)
+            if info:
+                return dict(info)   # trả bản sao để tránh race condition
+            return None
+
+    def deliver_punch_signal(self, target_peer_id: str, msg: Dict[str, Any]) -> bool:
+        """
+        Gửi PUNCH_SIGNAL tới target_peer_id qua signal channel của họ.
+        Không giữ lock trong khi gửi mạng.
+
+        Returns:
+            True  nếu gửi thành công.
+            False nếu peer không có signal channel hoặc gửi lỗi.
+        """
+        # Lấy socket tham chiếu (ngoài lock)
+        info = self.get_signal_info(target_peer_id)
+        if not info:
+            return False
+
+        sock = info["sock"]
+        try:
+            from protocol.messages import send_msg
+            with info["send_lock"]:
+                sent = send_msg(sock, msg)
+            if sent:
+                return True
+            self.unregister_signal_channel(target_peer_id, sock)
+            return False
+        except Exception as e:
+            print(f"[Tracker State] Lỗi gửi PUNCH_SIGNAL tới {target_peer_id}: {e}")
+            self.unregister_signal_channel(target_peer_id, sock)
+            return False
+
+    def deliver_signal(self, target_peer_id: str, msg: Dict[str, Any]) -> bool:
+        return self.deliver_punch_signal(target_peer_id, msg)

@@ -5,9 +5,13 @@ Cách chạy:
     python run_client.py                        # localhost, cổng 6881
     python run_client.py 6882                   # cổng tùy chọn
     python run_client.py 6881 192.168.1.10      # qua mạng LAN
+    python run_client.py 6881 203.0.113.10 --transport auto  # tracker/relay trên VPS
 """
-import os, sys, random
-
+import argparse
+import ipaddress
+import os
+import secrets
+import sys
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -17,8 +21,6 @@ if sys.platform == "win32":
 from peer.client import P2PClient
 
 # ── Cấu hình ──
-LISTEN_PORT  = int(sys.argv[1]) if len(sys.argv) > 1 else 6881
-TRACKER_HOST = sys.argv[2]     if len(sys.argv) > 2 else "127.0.0.1"
 TRACKER_PORT = 8000
 
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -26,9 +28,63 @@ SHARED_DIR   = os.path.join(BASE_DIR, "demo_workspace", "shared")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "demo_workspace", "downloads")
 
 
-def print_menu(peer_id: str) -> None:
+def ipv4_address(value: str) -> str:
+    """Chỉ chấp nhận IPv4 vì các socket của dự án đang dùng AF_INET."""
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError as exc:
+        raise argparse.ArgumentTypeError(f"IPv4 không hợp lệ: {value}") from exc
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="P2P client chia sẻ file")
+    parser.add_argument("listen_port", nargs="?", type=int, default=6881)
+    parser.add_argument("tracker_host", nargs="?", default="127.0.0.1",
+                        help="Địa chỉ Tracker/Relay (IPv4 hoặc host:port trên VPS)")
+    parser.add_argument(
+        "--tracker-port",
+        type=int,
+        default=None,
+        help="Cổng của Tracker (mặc định: 8000 hoặc lấy từ tracker_host)",
+    )
+    parser.add_argument(
+        "--advertise-ip",
+        type=ipv4_address,
+        help="IPv4 TCP có thể truy cập trực tiếp; mặc định dùng IP LAN",
+    )
+    parser.add_argument("--transport", choices=("auto", "tcp", "udp"), default="auto",
+                        help="auto: TCP/UDP trực tiếp rồi relay; tcp/udp: chỉ thử đường trực tiếp")
+    parser.add_argument("--udp-parallel", type=int, default=4,
+                        help="Số mảnh UDP tải đồng thời (1–4, mặc định: 4)")
+    parser.add_argument("--udp-window", type=int, default=48,
+                        help="Số gói UDP chờ ACK mỗi mảnh (16–128, mặc định: 48)")
+    args = parser.parse_args(argv)
+    if not 1 <= args.listen_port <= 65535:
+        parser.error("listen_port phải nằm trong khoảng 1–65535")
+    if not 1 <= args.udp_parallel <= 4:
+        parser.error("--udp-parallel phải trong khoảng 1–4")
+    if not 16 <= args.udp_window <= 128:
+        parser.error("--udp-window phải trong khoảng 16–128")
+
+    # Hỗ trợ truyền tracker dạng host:port (tiện khi dùng ngrok TCP)
+    tracker_port = TRACKER_PORT
+    if ":" in args.tracker_host and not args.tracker_host.startswith("["):
+        parts = args.tracker_host.split(":")
+        args.tracker_host = parts[0]
+        try:
+            tracker_port = int(parts[1])
+        except ValueError:
+            parser.error(f"Cổng tracker không hợp lệ trong '{parts[0]}:{parts[1]}'")
+    if args.tracker_port is not None:
+        tracker_port = args.tracker_port
+
+    args.tracker_port = tracker_port
+    return args
+
+
+def print_menu(peer_id: str, listen_port: int, tracker_host: str, tracker_port: int = TRACKER_PORT) -> None:
     print(f"\n{'='*50}")
-    print(f"  P2P CLIENT [{peer_id}] - Cổng {LISTEN_PORT} | Tracker {TRACKER_HOST}:{TRACKER_PORT}")
+    print(f"  P2P CLIENT [{peer_id}] - Cổng {listen_port} | Tracker {tracker_host}:{tracker_port}")
     print(f"{'='*50}")
     print("  1. Chia sẻ file")
     print("  2. Tải file")
@@ -38,13 +94,18 @@ def print_menu(peer_id: str) -> None:
 
 
 def main() -> None:
-    peer_id = f"peer_{random.randint(1000, 9999)}"
+    args = parse_args()
+    peer_id = f"peer_{secrets.token_hex(8)}"
 
     client = P2PClient(
         peer_id=peer_id,
-        listen_port=LISTEN_PORT,
-        tracker_host=TRACKER_HOST,
-        tracker_port=TRACKER_PORT,
+        listen_port=args.listen_port,
+        tracker_host=args.tracker_host,
+        tracker_port=args.tracker_port,
+        advertise_ip=args.advertise_ip,
+        transport=args.transport,
+        udp_parallel=args.udp_parallel,
+        udp_window=args.udp_window,
     )
     client.start()
 
@@ -53,7 +114,7 @@ def main() -> None:
 
     try:
         while True:
-            print_menu(peer_id)
+            print_menu(peer_id, args.listen_port, args.tracker_host, args.tracker_port)
             choice = input("Lựa chọn: ").strip()
 
             if choice == "1":

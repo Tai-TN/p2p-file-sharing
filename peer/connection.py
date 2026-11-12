@@ -71,13 +71,28 @@ class PeerConnection:
             if not bitfield_msg or bitfield_msg.get("type") != MessageType.BITFIELD.value:
                 raise ConnectionError("Không nhận được BITFIELD")
 
-            self.bitfield = bitfield_msg.get("bitfield", [])
+            self.bitfield = self._validate_bitfield(bitfield_msg.get("bitfield"))
             self.socket = sock
             self.last_activity = time.monotonic()
             return True
         except Exception:
             sock.close()
             return False
+
+    @staticmethod
+    def _validate_bitfield(value: Any) -> List[bool]:
+        if not isinstance(value, list) or any(bit not in (0, 1, False, True) for bit in value):
+            raise ValueError("BITFIELD không hợp lệ")
+        return list(value)
+
+    def attach_handshaken_socket(self, sock: socket.socket) -> None:
+        """Dùng socket direct hoặc relay đã hoàn tất HANDSHAKE để nhận BITFIELD."""
+        bitfield_msg = recv_msg(sock)
+        if bitfield_msg.get("type") != MessageType.BITFIELD.value:
+            raise ValueError("Không nhận được BITFIELD")
+        self.bitfield = self._validate_bitfield(bitfield_msg.get("bitfield"))
+        self.socket = sock
+        self.last_activity = time.monotonic()
 
     def send(
         self,
@@ -125,7 +140,7 @@ class PeerConnection:
             self.is_choked = False
         elif message_type == MessageType.HAVE.value:
             have_idx = message.get("piece_index")
-            if have_idx is not None:
+            if isinstance(have_idx, int) and not isinstance(have_idx, bool):
                 if 0 <= have_idx < len(self.bitfield):
                     self.bitfield[have_idx] = True
                 if self.on_have is not None:

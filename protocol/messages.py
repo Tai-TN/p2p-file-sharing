@@ -5,11 +5,26 @@ from enum import Enum
 from typing import Dict, Any, List, Optional
 
 class MessageType(str, Enum):
+    AUTH_CHALLENGE = "AUTH_CHALLENGE"
+    AUTH_RESPONSE = "AUTH_RESPONSE"
+    AUTH_OK = "AUTH_OK"
     # Tracker Messages
     ANNOUNCE = "ANNOUNCE"
     ANNOUNCE_RESPONSE = "ANNOUNCE_RESPONSE"
     GET_PEERS = "GET_PEERS"
     GET_PEERS_RESPONSE = "GET_PEERS_RESPONSE"
+
+    # NAT Traversal — Signaling (persistent channel giữa peer và Tracker)
+    SIGNAL_REGISTER = "SIGNAL_REGISTER"  # Peer đăng ký kênh signaling với Tracker
+    SIGNAL_READY    = "SIGNAL_READY"     # Tracker xác nhận kênh đã sẵn sàng
+    PUNCH_REQUEST   = "PUNCH_REQUEST"    # Peer A yêu cầu Tracker báo cho Peer B punch
+    PUNCH_SIGNAL    = "PUNCH_SIGNAL"     # Tracker gửi thông tin endpoint để peer bắt đầu punch
+    PUNCH_FAILED    = "PUNCH_FAILED"     # Target peer không online hoặc không hỗ trợ hole punch
+    RELAY_OPEN      = "RELAY_OPEN"
+    RELAY_INVITE    = "RELAY_INVITE"
+    RELAY_JOIN      = "RELAY_JOIN"
+    RELAY_READY     = "RELAY_READY"
+    RELAY_ERROR     = "RELAY_ERROR"
 
     # Peer-to-Peer Messages
     HANDSHAKE = "HANDSHAKE"
@@ -20,81 +35,81 @@ class MessageType(str, Enum):
     PIECE = "PIECE"
     KEEP_ALIVE = "KEEP_ALIVE"
     ERROR = "ERROR"
-
-    # Trạng thái choking: điều khiển Peer nào được phép gửi REQUEST.
     CHOKE = "CHOKE"
     UNCHOKE = "UNCHOKE"
     INTERESTED = "INTERESTED"
     NOT_INTERESTED = "NOT_INTERESTED"
 
-
 def recv_exact(sock, num_bytes: int) -> bytes:
     """
     Hàm bổ trợ đọc chính xác N bytes từ TCP Socket.
-    Ném EOFError nếu socket bị đóng khi chưa đọc đủ dữ liệu.
     """
     buf = bytearray()
     while len(buf) < num_bytes:
         chunk = sock.recv(num_bytes - len(buf)) # Số byte còn thiếu vẫn cần nhận
         if not chunk:
             # Socket bị đóng hoặc hỏng kết nối khi chưa đọc đủ data
-            raise EOFError
+            raise EOFError("Socket đóng trước khi đọc đủ dữ liệu")
         buf.extend(chunk)
     return bytes(buf)
 
 def send_msg(sock, payload: Dict[str, Any]) -> bool:
-    """
-    Gửi 1 thông điệp JSON có length-prefix.
-    Ném OSError nếu socket lỗi (người gọi tự xử lý).
-    """
-    raw_json = json.dumps(payload).encode('utf-8') # dump : Chuyển Dict -> Json
-    length_prefix = struct.pack(">I", len(raw_json)) # Đóng gói thành 1 chuỗi nhị phân
-    sock.sendall(length_prefix + raw_json)
+    raw_json = json.dumps(payload).encode('utf-8')
+    if not 0 < len(raw_json) <= 2 * 1024 * 1024:
+        raise ValueError("Message vượt giới hạn 2 MiB")
+    sock.sendall(struct.pack(">I", len(raw_json)) + raw_json)
     return True
+
 
 
 def recv_msg(sock) -> Dict[str, Any]:
     """
     Nhận 1 thông điệp JSON hoàn chỉnh từ socket bằng quy tắc Length-prefix framing.
-
-    Ném:
-      - EOFError: peer đóng kết nối
-      - socket.timeout / OSError: lỗi mạng
-      - Exception: dữ liệu nhận được không phải JSON object hợp lệ
     """
     length_prefix = recv_exact(sock, 4)
     msg_len = struct.unpack(">I", length_prefix)[0]
+    if not 0 < msg_len <= 2 * 1024 * 1024:
+        raise ValueError("Message vượt giới hạn 2 MiB")
     raw_json = recv_exact(sock, msg_len)
-
     try:
-        result = json.loads(raw_json.decode('utf-8'))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise Exception("JSON khong hop le") from e
-
-    if not isinstance(result, dict):
-        raise Exception("Thong diep JSON sai kieu du lieu")
-
-    return result
-
+        message = json.loads(raw_json.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("JSON không hợp lệ") from exc
+    if not isinstance(message, dict):
+        raise ValueError("Thông điệp JSON phải là object")
+    return message
 
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 
 def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
                         event: str = "started", downloaded: int = 0, left: int = 0,
+                        udp_port: int = 0, public_ip: str = "",
                         bad_peers: Optional[List[str]] = None,
                         name: str = "") -> Dict[str, Any]:
-    # "name" là tên file (không bắt buộc) để Tracker hiển thị trên giao diện quản trị.
+    """
+    Tạo thông điệp ANNOUNCE gửi lên Tracker.
+
+    Các trường mới cho NAT traversal:
+      - udp_port:  UDP port đã được NAT map ra ngoài (lấy từ STUN). Peer khác
+                   dùng trường này để thực hiện UDP hole punch.
+      - public_ip: Public IP lấy từ STUN. Tracker ưu tiên dùng IP này thay vì
+                   IP lấy từ TCP socket khi báo lại cho các peer khác.
+                   Để trống nếu chưa chạy STUN.
+      - name:      Tên file (không bắt buộc) để Tracker hiển thị trên giao diện quản trị.
+    """
     return {
         "name": name,
         "type": MessageType.ANNOUNCE.value,
         "info_hash": info_hash,
         "peer_id": peer_id,
-        "ip": ip,           # IP thực của máy — để Tracker báo đúng cho peer khác kết nối vào
-        "port": port,
+        "ip": ip,           # IP LAN tự báo — Tracker dùng làm fallback
+        "port": port,       # TCP port lắng nghe (upload mảnh)
         "event": event,
         "downloaded": downloaded,
         "left": left,
-        "bad_peers": bad_peers or []  # Danh sách peer_id bị xác nhận là chết
+        "udp_port": udp_port,   # UDP port đã STUN-mapped (0 = chưa có STUN)
+        "public_ip": public_ip,  # Public IP từ STUN (rỗng = chưa có STUN)
+        "bad_peers": bad_peers or [],
     }
 
 def create_get_peers_msg(info_hash: str, peer_id: str) -> Dict[str, Any]:
@@ -149,21 +164,70 @@ def create_keepalive_msg() -> Dict[str, Any]:
         "type": MessageType.KEEP_ALIVE.value
     }
 
-
-# Các message điều khiển Tit-for-Tat không chứa payload ngoài trường "type".
-
 def create_choke_msg() -> Dict[str, Any]:
-    """Báo cho Peer nhận rằng tạm thời không được gửi REQUEST."""
     return {"type": MessageType.CHOKE.value}
 
 def create_unchoke_msg() -> Dict[str, Any]:
-    """Báo cho Peer nhận rằng được phép gửi REQUEST."""
     return {"type": MessageType.UNCHOKE.value}
 
 def create_interested_msg() -> Dict[str, Any]:
-    """Báo rằng ta đang cần piece từ Peer đối diện."""
     return {"type": MessageType.INTERESTED.value}
 
 def create_not_interested_msg() -> Dict[str, Any]:
-    """Báo rằng hiện tại ta không cần piece từ Peer đối diện."""
     return {"type": MessageType.NOT_INTERESTED.value}
+
+
+# ── NAT Traversal / Signaling message builders ────────────────────────────────
+
+def create_signal_register_msg(peer_id: str, ip: str, udp_port: int,
+                                tcp_port: int, candidates: list = None) -> Dict[str, Any]:
+    """
+    Peer gửi lên Tracker để mở kênh signaling persistent.
+    - ip, udp_port: public endpoint từ STUN (dùng cho hole punch)
+    - tcp_port: TCP port lắng nghe (dùng sau khi hole punch thành công)
+    """
+    return {
+        "type":     MessageType.SIGNAL_REGISTER.value,
+        "peer_id":  peer_id,
+        "ip":       ip,
+        "udp_port": udp_port,
+        "tcp_port": tcp_port,
+        "candidates": candidates or [],
+    }
+
+
+def create_punch_request_msg(target_peer_id: str) -> Dict[str, Any]:
+    """
+    Peer A gửi qua signal channel để yêu cầu Tracker báo Peer B cùng punch.
+    Endpoint của A đã được lưu lúc SIGNAL_REGISTER → không cần gửi lại.
+    """
+    return {
+        "type":           MessageType.PUNCH_REQUEST.value,
+        "target_peer_id": target_peer_id,
+    }
+
+
+def create_punch_signal_msg(peer_id: str, ip: str, udp_port: int,
+                             tcp_port: int, candidates: list = None) -> Dict[str, Any]:
+    """
+    Tracker gửi cho peer để thông báo: có peer khác muốn kết nối tới bạn.
+    - peer_id: ID của bên kia (để leecher biết punch với ai)
+    - ip, udp_port: public UDP endpoint của bên kia để gửi UDP probe
+    - tcp_port: TCP port của bên kia (fallback kết nối sau hole punch)
+    """
+    return {
+        "type":     MessageType.PUNCH_SIGNAL.value,
+        "peer_id":  peer_id,
+        "ip":       ip,
+        "udp_port": udp_port,
+        "tcp_port": tcp_port,
+        "candidates": candidates or [],
+    }
+
+
+def create_punch_failed_msg(reason: str) -> Dict[str, Any]:
+    """Tracker thông báo hole punch thất bại (peer target không hỗ trợ hoặc offline)."""
+    return {
+        "type":   MessageType.PUNCH_FAILED.value,
+        "reason": reason,
+    }
