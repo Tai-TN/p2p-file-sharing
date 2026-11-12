@@ -156,8 +156,11 @@ class TrackerSignalChannel:
             sock = self._sock
         if not sock:
             return False
-        with self._send_lock:
-            sent = send_msg(sock, msg)
+        try:
+            with self._send_lock:
+                sent = send_msg(sock, msg)
+        except (OSError, ValueError):
+            sent = False
         if not sent:
             self._close_socket(sock)
         return sent
@@ -285,8 +288,11 @@ class TrackerSignalChannel:
                 sock = self._sock
             if not sock:
                 continue
-            with self._send_lock:
-                sent = send_msg(sock, keepalive_msg)
+            try:
+                with self._send_lock:
+                    sent = send_msg(sock, keepalive_msg)
+            except (OSError, ValueError):
+                sent = False
             if not sent:
                 self._close_socket(sock)
 

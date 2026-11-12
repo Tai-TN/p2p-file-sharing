@@ -38,7 +38,10 @@ class P2PClient:
     def __init__(self, peer_id: Optional[str] = None, listen_port: int = 6881,
                  tracker_host: str = "127.0.0.1", tracker_port: int = 8000,
                  advertise_ip: Optional[str] = None, transport: str = "auto",
-                 udp_parallel: int = 4, udp_window: int = 48):
+                 udp_parallel: int = 4, udp_window: int = 48,
+                 regular_slots: int = 2, optimistic_slots: int = 1,
+                 choking_interval: float = 20.0,
+                 measurement_window: float = 30.0):
         if transport not in ("auto", "tcp", "udp"):
             raise ValueError("transport phải là auto, tcp hoặc udp")
         if not isinstance(udp_parallel, int) or not 1 <= udp_parallel <= 4:
@@ -51,12 +54,20 @@ class P2PClient:
         self.listen_port = listen_port
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
+        self.regular_slots = regular_slots
+        self.optimistic_slots = optimistic_slots
+        self.choking_interval = choking_interval
+        self.measurement_window = measurement_window
 
         # Địa chỉ LAN mà peer khác dùng để kết nối tới máy này (fallback khi STUN thất bại).
         self.my_ip = advertise_ip if advertise_ip is not None else get_local_ip()
 
         # PeerNode bind 0.0.0.0 → chấp nhận kết nối từ mọi interface
-        self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port)
+        self.node = PeerNode(peer_id=self.peer_id, host="0.0.0.0", port=listen_port,
+                             regular_slots=regular_slots,
+                             optimistic_slots=optimistic_slots,
+                             choking_interval=choking_interval,
+                             measurement_window=measurement_window)
 
         # Kết quả STUN — None trước khi start() được gọi
         self.nat_info: Optional[NATInfo] = None
@@ -195,6 +206,11 @@ class P2PClient:
         for worker in workers:
             if worker is not threading.current_thread():
                 worker.join(timeout=1.0)
+        for task in snapshot:
+            try:
+                task["pm"].close()
+            except Exception:
+                pass
         print("[P2PClient] Đã dừng hoàn toàn.")
 
     # ── NAT traversal callbacks ───────────────────────────────────────────── #

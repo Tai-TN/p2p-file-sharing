@@ -6,6 +6,9 @@ Tài liệu này giải thích chi tiết kiến trúc hệ thống, danh sách 
 > Chế độ mặc định hiện là `auto`: thử TCP trực tiếp, UDP hole punching, rồi relay
 > TCP trên tracker. Hướng dẫn chạy trên VPS và giới hạn ở
 > [TRIEN_KHAI_VPS.md](TRIEN_KHAI_VPS.md).
+> Sau merge `main` vào `dev`, mỗi đường tải có bộ đo tốc độ peer riêng.
+> TCP trực tiếp và relay dùng `PeerConnection` cùng choking; UDP giữ tối đa
+> bốn yêu cầu mảnh song song và không dùng thông điệp choking.
 
 ---
 
@@ -34,9 +37,9 @@ File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-shari
 
 ### 1.1. Các hàm xử lý Socket Framing
 
-- **`recv_exact(sock, num_bytes) -> Optional[bytes]`**: Đọc đúng và đủ `num_bytes` từ socket TCP để giải quyết triệt để vấn đề xé gói (Fragmentation).
-- **`send_msg(sock, payload: dict) -> bool`**: Đóng gói Dictionary JSON với **4-byte length prefix** (Big-Endian) trước khi gửi qua TCP socket.
-- **`recv_msg(sock) -> Optional[dict]`**: Đọc 4 byte tiêu đề $\rightarrow$ giải mã lấy độ dài $L$ $\rightarrow$ đọc tiếp đúng $L$ bytes nội dung $\rightarrow$ `json.loads()`.
+- **`recv_exact(sock, num_bytes) -> bytes`**: Đọc đủ `num_bytes`; ném `EOFError` nếu socket đóng sớm.
+- **`send_msg(sock, payload: dict) -> bool`**: Đóng gói JSON với **4-byte length prefix**; ném exception khi gửi lỗi hoặc frame vượt 2 MiB.
+- **`recv_msg(sock) -> dict`**: Đọc length prefix, chặn frame quá 2 MiB và ném exception nếu EOF, timeout hoặc JSON sai.
 
 ### 1.2. Danh sách Message Builders
 
@@ -54,10 +57,10 @@ File: [protocol/messages.py](file:///home/taitn/Study/Năm 3/PBL4/p2p-file-shari
 ### 2.2. Module PieceManager (`storage/piece_manager.py`)
 
 - **`PieceManager.__init__()`**: Khởi tạo mảng `bitfield = [False] * num_pieces` và đối tượng khóa đa luồng `self.file_lock = threading.Lock()`.
-- **`_initialize_storage()`**: Tạo file trống và tiền phân bổ dung lượng (`truncate`), quét và xác minh các mảnh hiện có.
+- **`_initialize_storage()`**: Tạo file trống và tiền phân bổ dung lượng (`truncate`). Khi tiếp tục tải, engine xác minh lại SHA-256 của từng mảnh trên đĩa.
 - **`_get_piece_bounds(piece_index)`**: Tính vị trí byte `offset = piece_index * piece_length` trên đĩa.
 - **`read_piece(piece_index)`**: Kiểm tra mảnh đã có chưa, sau đó đọc dữ liệu từ đĩa bọc trong `with self.file_lock:`.
-- **`write_piece(piece_index, data)`**: Kiểm tra checksum SHA-256 trước. Nếu hợp lệ, ghi xuống đĩa bằng `seek(offset)` và `os.fsync()`, cập nhật `bitfield[piece_index] = True`.
+- **`write_piece(piece_index, data)`**: Kiểm tra SHA-256 trước, ghi qua file handle dùng chung, `flush()` và cập nhật `bitfield[piece_index] = True`.
 
 ---
 

@@ -167,6 +167,9 @@ class TrackerServer:
                     udp_port=udp_port,
                     public_ip=public_ip,
                 )
+                if event != "stopped":
+                    self.state.report_bad_peers(info_hash, peer_id,
+                                                msg.get("bad_peers", []))
 
                 # Trả về phản hồi thành công
                 response = {

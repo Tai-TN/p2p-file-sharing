@@ -2,7 +2,7 @@ import json
 import struct
 import base64
 from enum import Enum
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 class MessageType(str, Enum):
     AUTH_CHALLENGE = "AUTH_CHALLENGE"
@@ -35,8 +35,12 @@ class MessageType(str, Enum):
     PIECE = "PIECE"
     KEEP_ALIVE = "KEEP_ALIVE"
     ERROR = "ERROR"
+    CHOKE = "CHOKE"
+    UNCHOKE = "UNCHOKE"
+    INTERESTED = "INTERESTED"
+    NOT_INTERESTED = "NOT_INTERESTED"
 
-def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
+def recv_exact(sock, num_bytes: int) -> bytes:
     """
     Hàm bổ trợ đọc chính xác N bytes từ TCP Socket.
     """
@@ -45,49 +49,42 @@ def recv_exact(sock, num_bytes: int) -> Optional[bytes]:
         chunk = sock.recv(num_bytes - len(buf)) # Số byte còn thiếu vẫn cần nhận
         if not chunk:
             # Socket bị đóng hoặc hỏng kết nối khi chưa đọc đủ data
-            return None
+            raise EOFError("Socket đóng trước khi đọc đủ dữ liệu")
         buf.extend(chunk)
     return bytes(buf)
 
 def send_msg(sock, payload: Dict[str, Any]) -> bool:
-    try:
-        raw_json = json.dumps(payload).encode('utf-8') # dump : Chuyển Dict -> Json
-        length_prefix = struct.pack(">I", len(raw_json)) # Đóng gói thành 1 chuỗi nhị phân
-        sock.sendall(length_prefix + raw_json)
-        return True
-    except Exception as e:
-        print(f"[Protocol Error] Lỗi khi gửi message: {e}")
-        return False
+    raw_json = json.dumps(payload).encode('utf-8')
+    if not 0 < len(raw_json) <= 2 * 1024 * 1024:
+        raise ValueError("Message vượt giới hạn 2 MiB")
+    sock.sendall(struct.pack(">I", len(raw_json)) + raw_json)
+    return True
 
 
 
-def recv_msg(sock) -> Optional[Dict[str, Any]]:
+def recv_msg(sock) -> Dict[str, Any]:
     """
     Nhận 1 thông điệp JSON hoàn chỉnh từ socket bằng quy tắc Length-prefix framing.
     """
+    length_prefix = recv_exact(sock, 4)
+    msg_len = struct.unpack(">I", length_prefix)[0]
+    if not 0 < msg_len <= 2 * 1024 * 1024:
+        raise ValueError("Message vượt giới hạn 2 MiB")
+    raw_json = recv_exact(sock, msg_len)
     try:
-        length_prefix = recv_exact(sock, 4)
-        if not length_prefix:
-            return None
-        
-        msg_len = struct.unpack(">I", length_prefix)[0]
-        if not 0 < msg_len <= 2 * 1024 * 1024:
-            raise ValueError("Message vượt giới hạn 2 MiB")
-        
-        raw_json = recv_exact(sock, msg_len)
-        if not raw_json:
-            return None
-        
-        return json.loads(raw_json.decode('utf-8'))
-    except Exception as e:
-        print(f"[Protocol Error] Lỗi khi nhận message: {e}")
-        return None
+        message = json.loads(raw_json.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("JSON không hợp lệ") from exc
+    if not isinstance(message, dict):
+        raise ValueError("Thông điệp JSON phải là object")
+    return message
 
 # --- CAC HAM TAO MESSAGE MAU (BUILDERS) ---
 
 def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
                         event: str = "started", downloaded: int = 0, left: int = 0,
-                        udp_port: int = 0, public_ip: str = "") -> Dict[str, Any]:
+                        udp_port: int = 0, public_ip: str = "",
+                        bad_peers: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Tạo thông điệp ANNOUNCE gửi lên Tracker.
 
@@ -109,6 +106,7 @@ def create_announce_msg(info_hash: str, peer_id: str, port: int, ip: str = "",
         "left": left,
         "udp_port": udp_port,   # UDP port đã STUN-mapped (0 = chưa có STUN)
         "public_ip": public_ip,  # Public IP từ STUN (rỗng = chưa có STUN)
+        "bad_peers": bad_peers or [],
     }
 
 def create_get_peers_msg(info_hash: str, peer_id: str) -> Dict[str, Any]:
@@ -162,6 +160,18 @@ def create_keepalive_msg() -> Dict[str, Any]:
     return {
         "type": MessageType.KEEP_ALIVE.value
     }
+
+def create_choke_msg() -> Dict[str, Any]:
+    return {"type": MessageType.CHOKE.value}
+
+def create_unchoke_msg() -> Dict[str, Any]:
+    return {"type": MessageType.UNCHOKE.value}
+
+def create_interested_msg() -> Dict[str, Any]:
+    return {"type": MessageType.INTERESTED.value}
+
+def create_not_interested_msg() -> Dict[str, Any]:
+    return {"type": MessageType.NOT_INTERESTED.value}
 
 
 # ── NAT Traversal / Signaling message builders ────────────────────────────────

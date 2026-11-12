@@ -30,7 +30,10 @@ def connect_tracker(host: str, port: int, timeout: float = 5.0) -> socket.socket
             digest = hmac.new(secret.encode(), nonce.encode("ascii"), hashlib.sha256).hexdigest()
             if not send_msg(sock, {"type": MessageType.AUTH_RESPONSE.value, "digest": digest}):
                 raise ConnectionError("Không gửi được xác thực tới tracker")
-            result = recv_msg(sock)
+            try:
+                result = recv_msg(sock)
+            except EOFError as exc:
+                raise PermissionError("Tracker từ chối bí mật chung") from exc
             if not isinstance(result, dict) or result.get("type") != MessageType.AUTH_OK.value:
                 raise PermissionError("Tracker từ chối bí mật chung")
         return sock

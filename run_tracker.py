@@ -5,6 +5,13 @@ Chạy: python run_tracker.py
 import argparse
 import os
 import time
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from tracker.tracker_server import TrackerServer
 
 # ── Cấu hình ──

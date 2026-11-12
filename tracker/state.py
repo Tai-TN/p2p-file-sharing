@@ -16,6 +16,7 @@ class TrackerState:
         
         # Cấu trúc: { info_hash: { peer_id: { "ip": str, "port": int, "last_seen": float, "downloaded": int, "left": int } } }
         self.swarms: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._bad_reports: Dict[str, Dict[str, set[str]]] = {}
 
         # Signal channels: { peer_id -> socket } — kênh TCP persistent để push PUNCH_SIGNAL
         # Dùng lock riêng để không hold lock swarm trong khi gọi mạng
@@ -42,6 +43,7 @@ class TrackerState:
             if event == "stopped":
                 if peer_id in swarm:
                     del swarm[peer_id]
+                    self._forget_reports(info_hash, peer_id)
                     print(f"[Tracker State] Peer {peer_id} đã thoát khỏi swarm {info_hash[:8]}...")
                 return True
 
@@ -92,6 +94,35 @@ class TrackerState:
 
             return active_peers
 
+    def _forget_reports(self, info_hash: str, peer_id: str) -> None:
+        reports = self._bad_reports.get(info_hash, {})
+        reports.pop(peer_id, None)
+        for reporters in reports.values():
+            reporters.discard(peer_id)
+        if not reports:
+            self._bad_reports.pop(info_hash, None)
+
+    def report_bad_peers(self, info_hash: str, reporter_id: str,
+                         bad_peer_ids: List[str]) -> List[str]:
+        """Chỉ xóa một peer sau báo cáo của hai thành viên swarm khác nhau."""
+        removed: List[str] = []
+        with self.lock:
+            swarm = self.swarms.get(info_hash, {})
+            if reporter_id not in swarm or not isinstance(bad_peer_ids, list):
+                return removed
+            reports = self._bad_reports.setdefault(info_hash, {})
+            for bad_id in bad_peer_ids[:32]:
+                if (not isinstance(bad_id, str) or len(bad_id) > 128
+                        or bad_id == reporter_id or bad_id not in swarm):
+                    continue
+                reporters = reports.setdefault(bad_id, set())
+                reporters.add(reporter_id)
+                if len(reporters) >= 2:
+                    del swarm[bad_id]
+                    self._forget_reports(info_hash, bad_id)
+                    removed.append(bad_id)
+        return removed
+
     def has_peer(self, info_hash: str, peer_id: str) -> bool:
         with self.lock:
             peer = self.swarms.get(info_hash, {}).get(peer_id)
@@ -109,6 +140,7 @@ class TrackerState:
                     if now - swarm[peer_id]["last_seen"] > self.peer_timeout:
                         print(f"[Tracker Cleanup] Loại bỏ peer chết: {peer_id} khỏi swarm {info_hash[:8]}...")
                         del swarm[peer_id]
+                        self._forget_reports(info_hash, peer_id)
                         removed_count += 1
 
                 # Nếu swarm không còn peer nào thì dọn dẹp swarm

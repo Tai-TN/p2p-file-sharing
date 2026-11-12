@@ -11,6 +11,13 @@ import argparse
 import ipaddress
 import os
 import secrets
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from peer.client import P2PClient
 
 # ── Cấu hình ──
