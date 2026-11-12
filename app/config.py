@@ -6,7 +6,7 @@ import sys
 from typing import Any, Dict, List
 
 DEFAULTS: Dict[str, Any] = {
-    "tracker_host": "127.0.0.1",
+    "tracker_host": "32.236.238.77",
     "tracker_port": 8000,
     "listen_port": 6881,
     "peer_name": "",          # Rỗng → tự sinh peer_XXXX ở lần chạy đầu

@@ -2,7 +2,7 @@
 run_client.py — P2P Client (Seeder + Leecher)
 
 Cách chạy:
-    python run_client.py                        # localhost, cổng 6881
+    python run_client.py                        # tracker VPS mặc định, cổng 6881
     python run_client.py 6882                   # cổng tùy chọn
     python run_client.py 6881 192.168.1.10      # qua mạng LAN
     python run_client.py 6881 203.0.113.10 --transport auto  # tracker/relay trên VPS
@@ -39,7 +39,7 @@ def ipv4_address(value: str) -> str:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="P2P client chia sẻ file")
     parser.add_argument("listen_port", nargs="?", type=int, default=6881)
-    parser.add_argument("tracker_host", nargs="?", default="127.0.0.1",
+    parser.add_argument("tracker_host", nargs="?", default="32.236.238.77",
                         help="Địa chỉ Tracker/Relay (IPv4 hoặc host:port trên VPS)")
     parser.add_argument(
         "--tracker-port",
