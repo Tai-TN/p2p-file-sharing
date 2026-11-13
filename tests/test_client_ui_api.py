@@ -58,6 +58,13 @@ class ClientUiApiTest(unittest.TestCase):
         self.assertTrue(check_tracker("127.0.0.1", self.tracker_port))
         self.assertFalse(check_tracker("127.0.0.1", free_port(), timeout=0.5))
 
+    def test_check_tracker_rejects_port_that_is_not_tracker(self):
+        # Cổng TCP mở nhưng không trả lời theo giao thức Tracker → không được báo là OK.
+        with socket.socket() as dummy:
+            dummy.bind(("127.0.0.1", 0))
+            dummy.listen()
+            self.assertFalse(check_tracker("127.0.0.1", dummy.getsockname()[1], timeout=0.5))
+
     def test_share_reports_progress_and_download_completes(self):
         seeder = self._client("peer_seed")
         stages = []

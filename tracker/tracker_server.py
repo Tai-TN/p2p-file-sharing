@@ -211,6 +211,10 @@ class TrackerServer:
                 }
                 send_msg(conn, response)
 
+        except EOFError:
+            # Client đóng kết nối trước khi gửi đủ thông điệp (app bản cũ kiểm tra
+            # cổng, máy quét cổng trên Internet...). Bình thường, không cần ghi lỗi.
+            pass
         except Exception as e:
             print(f"[Tracker Server] Lỗi xử lý client {addr}: {e}")
         finally:

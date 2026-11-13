@@ -30,11 +30,21 @@ def get_local_ip() -> str:
 
 
 def check_tracker(host: str, port: int, timeout: float = 3.0) -> bool:
-    """Thử mở kết nối TCP tới Tracker; True nếu Tracker đang nhận kết nối."""
+    """Gửi một GET_PEERS rỗng tới Tracker; True nếu Tracker trả lời đúng giao thức.
+
+    Không chỉ mở rồi đóng cổng TCP: kiểu kiểm tra đó làm Tracker ghi lỗi
+    "Socket đóng trước khi đọc đủ dữ liệu" mỗi lần, và không phát hiện được
+    trường hợp sai bí mật chung hay cổng đó không phải Tracker.
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
+        with connect_tracker(host, port, timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            # info_hash toàn số 0 không trùng file thật nên Tracker trả danh sách rỗng.
+            if not send_msg(sock, create_get_peers_msg("0" * 64, "")):
+                return False
+            reply = recv_msg(sock)
+            return reply.get("type") == MessageType.GET_PEERS_RESPONSE.value
+    except (OSError, EOFError, ValueError, PermissionError, ConnectionError):
         return False
 
 

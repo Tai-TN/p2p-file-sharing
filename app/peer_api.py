@@ -311,11 +311,16 @@ class PeerApi:
     def restart_app(self) -> Dict[str, Any]:
         """Khởi động lại app để áp dụng cài đặt mới."""
         self._shutdown()
+        env = os.environ.copy()
         if getattr(sys, "frozen", False):
             cmd: List[str] = [sys.executable] + sys.argv[1:]
+            # Bản .exe (PyInstaller --onefile): nếu không đặt biến này, app mới dùng
+            # chung thư mục giải nén _MEIxxxx của app cũ, nên app cũ thoát không xóa
+            # được thư mục đó và hiện cảnh báo "Failed to remove temporary directory".
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         else:
             cmd = [sys.executable] + sys.argv
-        subprocess.Popen(cmd)
+        subprocess.Popen(cmd, env=env)
         if self._window is not None:
             self._window.destroy()
         return _ok()
